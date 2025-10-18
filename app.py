@@ -53,8 +53,7 @@ LEADERBOARD_COLUMNS = [
     ("Agent Name", "string"),
     ("Website", "string"),
     ("Total Reviews", "number"),
-    ("Accepted PRs", "number"),
-    ("Rejected PRs", "number"),
+    ("Merged PRs", "number"),
     ("Acceptance Rate (%)", "number"),
 ]
 
@@ -451,10 +450,10 @@ def extract_review_metadata(pr):
 
     PR status:
     - pr_status: 'open', 'merged', or 'closed'
-    - pr_merged: True if PR was merged (accepted), False otherwise
+    - pr_merged: True if PR was merged, False otherwise
     - pr_closed_at: Date when PR was closed/merged (if applicable)
 
-    Accepted PR = PR that was merged after agent review
+    Merged PR = PR that was merged after agent review
     Rejected PR = PR that was closed without merging after agent review
     """
     # Extract PR metadata from search results
@@ -721,16 +720,16 @@ def calculate_review_stats_from_metadata(metadata_list):
     Returns a dictionary with comprehensive review metrics.
 
     Acceptance Rate is calculated as:
-        accepted PRs / (accepted PRs + rejected PRs) * 100
+        merged PRs / (merged PRs + rejected PRs) * 100
 
-    Accepted PRs = PRs that were merged (pr_status='merged')
+    Merged PRs = PRs that were merged (pr_status='merged')
     Rejected PRs = PRs that were closed without merging (pr_status='closed')
     Pending PRs = PRs still open (pr_status='open') - excluded from acceptance rate
     """
     total_reviews = len(metadata_list)
 
-    # Count accepted PRs (merged)
-    accepted_prs = sum(1 for review_meta in metadata_list
+    # Count merged PRs (merged)
+    merged_prs = sum(1 for review_meta in metadata_list
                       if review_meta.get('pr_status') == 'merged')
 
     # Count rejected PRs (closed without merging)
@@ -742,13 +741,12 @@ def calculate_review_stats_from_metadata(metadata_list):
                      if review_meta.get('pr_status') == 'open')
 
     # Calculate acceptance rate (exclude pending PRs)
-    completed_prs = accepted_prs + rejected_prs
-    acceptance_rate = (accepted_prs / completed_prs * 100) if completed_prs > 0 else 0
+    completed_prs = merged_prs + rejected_prs
+    acceptance_rate = (merged_prs / completed_prs * 100) if completed_prs > 0 else 0
 
     return {
         'total_reviews': total_reviews,
-        'accepted_prs': accepted_prs,
-        'rejected_prs': rejected_prs,
+        'merged_prs': merged_prs,
         'pending_prs': pending_prs,
         'acceptance_rate': round(acceptance_rate, 2),
     }
@@ -767,8 +765,7 @@ def calculate_monthly_metrics_by_agent():
                 agent_name: {
                     'acceptance_rates': list of acceptance rates by month,
                     'total_reviews': list of review counts by month,
-                    'accepted_prs': list of accepted PR counts by month,
-                    'rejected_prs': list of rejected PR counts by month
+                    'merged_prs': list of merged PR counts by month,
                 }
             }
         }
@@ -820,14 +817,13 @@ def calculate_monthly_metrics_by_agent():
     for agent_name, month_dict in agent_month_data.items():
         acceptance_rates = []
         total_reviews_list = []
-        accepted_prs_list = []
-        rejected_prs_list = []
+        merged_prs_list = []
 
         for month in months:
             reviews_in_month = month_dict.get(month, [])
 
-            # Count accepted PRs (merged)
-            accepted_count = sum(1 for review in reviews_in_month
+            # Count merged PRs (merged)
+            merged_count = sum(1 for review in reviews_in_month
                                 if review.get('pr_status') == 'merged')
 
             # Count rejected PRs (closed without merging)
@@ -838,19 +834,17 @@ def calculate_monthly_metrics_by_agent():
             total_count = len(reviews_in_month)
 
             # Calculate acceptance rate (exclude pending PRs)
-            completed_count = accepted_count + rejected_count
-            acceptance_rate = (accepted_count / completed_count * 100) if completed_count > 0 else None
+            completed_count = merged_count + rejected_count
+            acceptance_rate = (merged_count / completed_count * 100) if completed_count > 0 else None
 
             acceptance_rates.append(acceptance_rate)
             total_reviews_list.append(total_count)
-            accepted_prs_list.append(accepted_count)
-            rejected_prs_list.append(rejected_count)
+            merged_prs_list.append(merged_count)
 
         result_data[agent_name] = {
             'acceptance_rates': acceptance_rates,
             'total_reviews': total_reviews_list,
-            'accepted_prs': accepted_prs_list,
-            'rejected_prs': rejected_prs_list
+            'merged_prs': merged_prs_list,
         }
 
     return {
@@ -1861,8 +1855,7 @@ def get_leaderboard_dataframe():
             data.get('agent_name', 'Unknown'),
             data.get('website', 'N/A'),
             data.get('total_reviews', 0),
-            data.get('accepted_prs', 0),
-            data.get('rejected_prs', 0),
+            data.get('merged_prs', 0),
             data.get('acceptance_rate', 0.0),
         ])
 
@@ -1871,7 +1864,7 @@ def get_leaderboard_dataframe():
     df = pd.DataFrame(rows, columns=column_names)
 
     # Ensure numeric types
-    numeric_cols = ["Total Reviews", "Accepted PRs", "Rejected PRs", "Acceptance Rate (%)"]
+    numeric_cols = ["Total Reviews", "Merged PRs", "Acceptance Rate (%)"]
     for col in numeric_cols:
         if col in df.columns:
             df[col] = pd.to_numeric(df[col], errors='coerce').fillna(0)

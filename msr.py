@@ -449,10 +449,10 @@ def extract_review_metadata(pr):
 
     PR status:
     - pr_status: 'open', 'merged', or 'closed'
-    - pr_merged: True if PR was merged (accepted), False otherwise
+    - pr_merged: True if PR was merged, False otherwise
     - pr_closed_at: Date when PR was closed/merged (if applicable)
 
-    Accepted PR = PR that was merged after agent review
+    merged PR = PR that was merged after agent review
     Rejected PR = PR that was closed without merging after agent review
     """
     # Extract PR metadata from search results
@@ -1050,16 +1050,16 @@ def calculate_review_stats_from_metadata(metadata_list):
     Returns a dictionary with comprehensive review metrics.
 
     Acceptance Rate is calculated as:
-        accepted PRs / (accepted PRs + rejected PRs) * 100
+        merged PRs / (merged PRs + rejected PRs) * 100
 
-    Accepted PRs = PRs that were merged (pr_status='merged')
+    merged PRs = PRs that were merged (pr_status='merged')
     Rejected PRs = PRs that were closed without merging (pr_status='closed')
     Pending PRs = PRs still open (pr_status='open') - excluded from acceptance rate
     """
     total_reviews = len(metadata_list)
 
-    # Count accepted PRs (merged)
-    accepted_prs = sum(1 for review_meta in metadata_list
+    # Count merged PRs (merged)
+    merged_prs = sum(1 for review_meta in metadata_list
                       if review_meta.get('pr_status') == 'merged')
 
     # Count rejected PRs (closed without merging)
@@ -1071,12 +1071,12 @@ def calculate_review_stats_from_metadata(metadata_list):
                      if review_meta.get('pr_status') == 'open')
 
     # Calculate acceptance rate (exclude pending PRs)
-    completed_prs = accepted_prs + rejected_prs
-    acceptance_rate = (accepted_prs / completed_prs * 100) if completed_prs > 0 else 0
+    completed_prs = merged_prs + rejected_prs
+    acceptance_rate = (merged_prs / completed_prs * 100) if completed_prs > 0 else 0
 
     return {
         'total_reviews': total_reviews,
-        'accepted_prs': accepted_prs,
+        'merged_prs': merged_prs,
         'rejected_prs': rejected_prs,
         'pending_prs': pending_prs,
         'acceptance_rate': round(acceptance_rate, 2),

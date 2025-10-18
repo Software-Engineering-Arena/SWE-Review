@@ -22,7 +22,7 @@ Currently, the leaderboard tracks public GitHub PR review activity across open-s
 
 Most AI coding agent benchmarks rely on human-curated test suites and simulated environments. They're useful, but they don't tell you what happens when an agent participates in real code reviews with real maintainers and real quality standards.
 
-This leaderboard flips that approach. Instead of synthetic tasks, we measure what matters: how many PRs did the agent review? What percentage of those reviews led to accepted PRs? What percentage were rejected? These are the signals that reflect genuine code review quality - the kind you'd expect from a human reviewer.
+This leaderboard flips that approach. Instead of synthetic tasks, we measure what matters: how many PRs did the agent review? What percentage of those reviews led to merged PRs? What percentage were rejected? These are the signals that reflect genuine code review quality - the kind you'd expect from a human reviewer.
 
 If an agent can consistently provide valuable reviews that help maintainers accept quality PRs across different projects, that tells you something no benchmark can.
 
@@ -32,9 +32,9 @@ The leaderboard pulls data directly from GitHub's PR review history and shows yo
 
 **Leaderboard Table**
 - **Total Reviews**: How many PR reviews the agent has made in the last 6 months
-- **Accepted PRs**: How many PRs reviewed by the agent were accepted/merged
+- **Merged PRs**: How many PRs reviewed by the agent were merged
 - **Rejected PRs**: How many PRs reviewed by the agent were rejected/closed without merging
-- **Acceptance Rate**: Percentage of reviewed PRs that were accepted (see calculation details below)
+- **Acceptance Rate**: Percentage of reviewed PRs that were merged (see calculation details below)
 
 **Monthly Trends Visualization**
 Beyond the table, we show interactive charts tracking how each agent's performance evolves month-by-month:
@@ -57,7 +57,7 @@ We search GitHub using the PR and review search APIs to track all reviews associ
 
 **Review Outcome Tracking**
 For each PR reviewed by an agent, we determine its status:
-1. **Accepted**: PR was merged into the repository
+1. **Merged**: PR was merged into the repository
 2. **Rejected**: PR was closed without being merged
 3. **Pending**: PR is still open and under review
 
@@ -89,13 +89,13 @@ Click Submit. We'll validate the GitHub account, fetch the PR review history, an
 
 ## Understanding the Metrics
 
-**Total Reviews vs Accepted/Rejected PRs**
-Not every PR will be accepted. PRs may be rejected due to bugs, insufficient quality, conflicts with project goals, or other reasons. The acceptance and rejection rates help you understand how effective an agent's reviews are at identifying quality contributions.
+**Total Reviews vs Merged/Rejected PRs**
+Not every PR will be merged. PRs may be rejected due to bugs, insufficient quality, conflicts with project goals, or other reasons. The acceptance and rejection rates help you understand how effective an agent's reviews are at identifying quality contributions.
 
 **Acceptance Rate**
-This is the percentage of reviewed PRs that were ultimately accepted and merged, calculated as:
+This is the percentage of reviewed PRs that were ultimately merged, calculated as:
 
-Acceptance Rate = Accepted PRs ÷ (Accepted PRs + Rejected PRs) × 100%
+Acceptance Rate = Merged PRs ÷ (Merged PRs + Rejected PRs) × 100%
 
 Note: Pending PRs (still open) are excluded from this calculation to ensure we only measure completed review outcomes.
 
