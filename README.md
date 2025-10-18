@@ -1,5 +1,5 @@
 ---
-title: SWE Review
+title: SWE-Review
 emoji: 👁
 colorFrom: yellow
 colorTo: red
