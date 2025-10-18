@@ -48,6 +48,7 @@ DEBUG_REVIEW_METADATA_CACHE = defaultdict(list)
 
 AGENTS_REPO = "SWE-Arena/swe_agents"  # HuggingFace dataset for agent metadata
 REVIEW_METADATA_REPO = "SWE-Arena/review_metadata"  # HuggingFace dataset for review metadata
+LEADERBOARD_TIME_FRAME_DAYS = 180  # Time frame for leaderboard (past 6 months)
 
 LEADERBOARD_COLUMNS = [
     ("Agent Name", "string"),
@@ -770,17 +771,14 @@ def calculate_monthly_metrics_by_agent():
             }
         }
     """
-    # Get current year for loading metadata
-    current_year = datetime.now().year
-
     # Load ALL agents from HuggingFace agents repo
     agents = load_agents_from_hf()
 
     # Create mapping from agent_identifier to agent_name
     identifier_to_name = {agent.get('github_identifier'): agent.get('agent_name') for agent in agents if agent.get('github_identifier')}
 
-    # Load all review metadata for current year from review_metadata dataset
-    all_metadata = load_review_metadata_for_year(current_year)
+    # Load all review metadata from review_metadata dataset
+    all_metadata = load_review_metadata()
 
     if not all_metadata:
         return {'agents': [], 'months': [], 'data': {}}
@@ -967,27 +965,42 @@ def save_review_metadata_to_hf(metadata_list, agent_identifier):
         return False
 
 
-def load_review_metadata_for_year(year):
+def load_review_metadata():
     """
-    Load all review metadata for a specific year from HuggingFace.
-    Scans all agent folders and loads daily files matching the year.
-    In debug mode, loads from in-memory cache if available.
+    Load review metadata from the last LEADERBOARD_TIME_FRAME_DAYS.
+
+    In debug mode, loads from in-memory cache if available and filters by time frame.
 
     Structure: [agent_identifier]/YYYY.MM.DD.jsonl
 
     Returns:
         List of dictionaries with 'agent_identifier' added to each review metadata.
+        Only includes reviews from the last LEADERBOARD_TIME_FRAME_DAYS.
     """
+    # Calculate cutoff date based on LEADERBOARD_TIME_FRAME_DAYS
+    current_time = datetime.now(timezone.utc)
+    cutoff_date = current_time - timedelta(days=LEADERBOARD_TIME_FRAME_DAYS)
+
     # In debug mode, check in-memory cache first
     if DEBUG_MODE and DEBUG_REVIEW_METADATA_CACHE:
         all_metadata = []
         for agent_identifier, metadata_list in DEBUG_REVIEW_METADATA_CACHE.items():
             for review_meta in metadata_list:
+                # Filter by time frame
+                reviewed_at = review_meta.get('reviewed_at')
+                if reviewed_at:
+                    try:
+                        dt = datetime.fromisoformat(reviewed_at.replace('Z', '+00:00'))
+                        if dt < cutoff_date:
+                            continue  # Skip reviews older than time frame
+                    except Exception:
+                        pass  # Keep reviews with unparseable dates
+
                 review_with_agent = review_meta.copy()
                 review_with_agent['agent_identifier'] = agent_identifier
                 all_metadata.append(review_with_agent)
         if all_metadata:
-            print(f"🐛 DEBUG MODE: Loading review metadata from in-memory cache ({len(all_metadata)} reviews)")
+            print(f"🐛 DEBUG MODE: Loading review metadata from in-memory cache (last {LEADERBOARD_TIME_FRAME_DAYS} days, {len(all_metadata)} reviews)")
             return all_metadata
 
     try:
@@ -997,22 +1010,33 @@ def load_review_metadata_for_year(year):
         # List all files in the repository
         files = api.list_repo_files(repo_id=REVIEW_METADATA_REPO, repo_type="dataset")
 
-        # Filter for files matching the year pattern: [agent_identifier]/YYYY.MM.DD.jsonl
-        # Extract year from filename
-        year_str = str(year)
-        year_files = []
+        # Filter for files matching the pattern: [agent_identifier]/YYYY.MM.DD.jsonl
+        # AND within the time frame (parse date from filename)
+        time_frame_files = []
         for f in files:
             if f.endswith('.jsonl'):
                 parts = f.split('/')
                 if len(parts) == 2:  # [agent_identifier]/YYYY.MM.DD.jsonl
                     filename = parts[1]
-                    if filename.startswith(year_str + '.'):
-                        year_files.append(f)
+                    # Parse date from filename: YYYY.MM.DD.jsonl
+                    try:
+                        date_part = filename.replace('.jsonl', '')  # Get YYYY.MM.DD
+                        date_components = date_part.split('.')
+                        if len(date_components) == 3:
+                            file_year, file_month, file_day = map(int, date_components)
+                            file_date = datetime(file_year, file_month, file_day, tzinfo=timezone.utc)
 
-        print(f"📥 Loading review metadata for {year} ({len(year_files)} daily files across all agents)...")
+                            # Only include files within the time frame
+                            if file_date >= cutoff_date:
+                                time_frame_files.append(f)
+                    except Exception:
+                        # If we can't parse the date, skip this file
+                        continue
+
+        print(f"📥 Loading review metadata from last {LEADERBOARD_TIME_FRAME_DAYS} days ({len(time_frame_files)} daily files across all agents)...")
 
         all_metadata = []
-        for filename in year_files:
+        for filename in time_frame_files:
             try:
                 # Extract agent_identifier from path (first part)
                 # Format: agent_identifier/YYYY.MM.DD.jsonl
@@ -1031,20 +1055,32 @@ def load_review_metadata_for_year(year):
                 )
                 day_metadata = load_jsonl(file_path)
 
-                # Add agent_identifier to each review metadata for processing
+                # Add agent_identifier and filter by time frame (double-check)
+                filtered_count = 0
                 for review_meta in day_metadata:
-                    review_meta['agent_identifier'] = agent_identifier
+                    # Validate review date is within time frame
+                    reviewed_at = review_meta.get('reviewed_at')
+                    if reviewed_at:
+                        try:
+                            dt = datetime.fromisoformat(reviewed_at.replace('Z', '+00:00'))
+                            if dt < cutoff_date:
+                                continue  # Skip reviews older than time frame
+                        except Exception:
+                            pass  # Keep reviews with unparseable dates
 
-                all_metadata.extend(day_metadata)
-                print(f"   ✓ Loaded {len(day_metadata)} reviews from {filename}")
+                    review_meta['agent_identifier'] = agent_identifier
+                    all_metadata.append(review_meta)
+                    filtered_count += 1
+
+                print(f"   ✓ Loaded {filtered_count} reviews from {filename}")
             except Exception as e:
                 print(f"   Warning: Could not load {filename}: {str(e)}")
 
-        print(f"✓ Loaded {len(all_metadata)} total reviews for {year}")
+        print(f"✓ Loaded {len(all_metadata)} total reviews from last {LEADERBOARD_TIME_FRAME_DAYS} days")
         return all_metadata
 
     except Exception as e:
-        print(f"✗ Error loading review metadata for {year}: {str(e)}")
+        print(f"✗ Error loading review metadata from last {LEADERBOARD_TIME_FRAME_DAYS} days: {str(e)}")
         return []
 
 
@@ -1532,7 +1568,6 @@ def update_all_agents_incremental():
     Returns dictionary of all agent data with current stats.
     """
     token = get_github_token()
-    current_year = datetime.now().year
 
     # Load agent metadata from HuggingFace
     agents = load_agents_from_hf()
@@ -1587,9 +1622,9 @@ def update_all_agents_incremental():
             else:
                 print(f"   No new reviews to save")
 
-            # Load ALL metadata for current year to calculate stats (aggregates entire last 6 months)
+            # Load ALL metadata to calculate stats (aggregates entire last 6 months)
             print(f"📊 Calculating statistics from ALL stored metadata (last 6 months)...")
-            all_year_metadata = load_review_metadata_for_year(current_year)
+            all_year_metadata = load_review_metadata()
 
             # Filter for this specific agent
             agent_metadata = [review for review in all_year_metadata if review.get("agent_identifier") == identifier]
@@ -1624,8 +1659,6 @@ def construct_leaderboard_from_metadata():
     Returns dictionary of agent stats.
     """
     print("📊 Constructing leaderboard from review metadata...")
-    current_year = datetime.now().year
-
     # Load agents
     agents = load_agents_from_hf()
     if not agents:
@@ -1633,7 +1666,7 @@ def construct_leaderboard_from_metadata():
         return {}
 
     # Load all review metadata for current year
-    all_metadata = load_review_metadata_for_year(current_year)
+    all_metadata = load_review_metadata()
 
     cache_dict = {}
 
