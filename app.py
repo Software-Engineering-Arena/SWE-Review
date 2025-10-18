@@ -1554,15 +1554,18 @@ def save_agent_to_hf(data):
 
 def update_all_agents_incremental():
     """
-    Memory-efficient incremental update of review statistics for all agents.
+    Comprehensive update of review statistics for all agents.
 
     Strategy:
-    1. For each agent, load existing data from SWE-Arena/review_metadata
-    2. Identify already-mined dates (based on filename: YYYY.MM.DD.jsonl)
-    3. Only fetch reviews from dates that haven't been mined yet (within last 6 months)
-    4. If no data exists at all, mine everything from scratch
+    1. For each agent, re-mine ALL reviews within the 6-month window
+    2. This ensures review metadata is always fresh and up-to-date
+    3. Critical for catching status changes (closed/reverted PRs)
+    4. Overwrites existing day files with current data from GitHub API
     5. Store minimal metadata (not full review objects) to avoid storage limits
     6. Construct leaderboard from ALL stored metadata (last 6 months)
+
+    Note: Unlike the old approach, this does NOT skip already-mined dates.
+    This is essential to prevent stale metadata (e.g., reviews closed after initial mining).
 
     Returns dictionary of all agent data with current stats.
     """
@@ -1593,26 +1596,21 @@ def update_all_agents_incremental():
             # Get already-mined dates for this agent (last 6 months)
             already_mined_dates = get_already_mined_dates(identifier, n_months=6)
 
-            if already_mined_dates:
-                print(f"📅 Found {len(already_mined_dates)} already-mined dates")
-                print(f"   Skipping these dates and fetching only new data...")
-                # Fetch only reviews from dates not yet mined
-                new_metadata = fetch_all_reviews_metadata(
-                    identifier,
-                    agent_name,
-                    token,
-                    start_from_date=None,  # Use full 6-month range
-                    exclude_dates=already_mined_dates  # But exclude already-mined dates
-                )
-            else:
-                print(f"📅 No existing data found. Mining everything from scratch...")
-                # Mine everything from scratch (full 6-month range)
-                new_metadata = fetch_all_reviews_metadata(
-                    identifier,
-                    agent_name,
-                    token,
-                    start_from_date=None
-                )
+            # Always re-mine ALL dates within 6-month window to ensure fresh data
+            # This is critical because review metadata can become stale:
+            # - PRs can be closed/reverted after initial mining
+            # - Status changes need to be captured in daily files
+            print(f"📅 Re-mining ALL dates within 6-month window (including {len(already_mined_dates)} existing dates)")
+            print(f"   This ensures all review metadata is up-to-date...")
+
+            # Fetch ALL reviews (no exclusions) to refresh metadata
+            new_metadata = fetch_all_reviews_metadata(
+                identifier,
+                agent_name,
+                token,
+                start_from_date=None,  # Use full 6-month range
+                exclude_dates=None  # DO NOT exclude - always refresh everything
+            )
 
             if new_metadata:
                 # Save new metadata to HuggingFace (organized by agent_identifier/YYYY.MM.DD.jsonl)
@@ -1986,58 +1984,36 @@ def submit_agent(identifier, agent_name, organization, description, website):
 
 def daily_update_task():
     """
-    Daily scheduled task (runs at 12:00 AM UTC) for smart review updates.
+    Daily scheduled task (runs at 12:00 AM UTC) for comprehensive review mining.
 
     Strategy:
-    1. For each agent, refresh open reviews from last 6 months
-    2. Skip reviews that are already closed/resolved (no API calls)
-    3. Only fetch status for open reviews to check if they've been closed/resolved
-    4. Update leaderboard with refreshed data
+    1. Re-mine ALL reviews within the 6-month window for all agents
+    2. This ensures review metadata is always fresh, catching:
+       - PRs that were closed/reverted since last mining
+       - Status changes (is_closed, state_reason, closed_at)
+       - Any other metadata updates
+    3. Updates ALL day files within LEADERBOARD_TIME_FRAME_DAYS
 
-    This is much more efficient than fetching all reviews every time.
+    Unlike the old selective refresh approach, this guarantees no stale data.
     """
     print(f"\n{'='*80}")
-    print(f"🕛 Daily update started at {datetime.now(timezone.utc).isoformat()}")
+    print(f"🕛 Daily Regular Mining started at {datetime.now(timezone.utc).isoformat()}")
     print(f"{'='*80}")
 
     try:
-        token = get_github_token()
+        # Run full incremental update for all agents
+        # This will re-mine everything in the 6-month window
+        print(f"📋 Starting comprehensive re-mining of all agents (6-month window)...")
 
-        # Load all agents
-        agents = load_agents_from_hf()
-        if not agents:
-            print("No agents found")
-            return
-
-        print(f"📋 Processing {len(agents)} agents...")
-
-        total_checked = 0
-        total_updated = 0
-
-        # Refresh open reviews for each agent (last 6 months)
-        for agent in agents:
-            identifier = agent.get('github_identifier')
-            agent_name = agent.get('agent_name', 'Unknown')
-
-            if not identifier:
-                continue
-
-            print(f"\n{'='*60}")
-            print(f"Processing: {agent_name} ({identifier})")
-            print(f"{'='*60}")
-
-            # Refresh open reviews from last 6 months
-            checked, updated = refresh_review_status_for_agent(identifier, token)
-            total_checked += checked
-            total_updated += updated
+        update_all_agents_incremental()
 
         print(f"\n{'='*80}")
-        print(f"📊 Refresh Summary:")
-        print(f"   Total open reviews checked: {total_checked}")
-        print(f"   Reviews updated (newly reverted): {total_updated}")
+        print(f"📊 Mining Summary:")
+        print(f"   All agents re-mined successfully within 6-month window")
+        print(f"   All review metadata refreshed and up-to-date")
         print(f"{'='*80}")
 
-        print(f"\n✅ Daily update completed at {datetime.now(timezone.utc).isoformat()}")
+        print(f"\n✅ Daily Regular Mining completed at {datetime.now(timezone.utc).isoformat()}")
 
     except Exception as e:
         print(f"✗ Daily update failed: {str(e)}")
@@ -2078,12 +2054,12 @@ scheduler = BackgroundScheduler(timezone="UTC")
 scheduler.add_job(
     daily_update_task,
     trigger=CronTrigger(hour=0, minute=0),  # 12:00 AM UTC daily
-    id='daily_review_refresh',
-    name='Daily Review Status Refresh',
+    id='daily_review_mining',
+    name='Daily Regular Review Mining',
     replace_existing=True
 )
 scheduler.start()
-print("✓ Scheduler started: Daily updates at 12:00 AM UTC")
+print("✓ Scheduler started: Daily Regular Mining at 12:00 AM UTC (re-mines all reviews within 6-month window)")
 
 # Create Gradio interface
 with gr.Blocks(title="SWE Agent Review Leaderboard", theme=gr.themes.Soft()) as app:
