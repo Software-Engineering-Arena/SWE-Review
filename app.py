@@ -584,7 +584,7 @@ def update_pr_status(metadata_list, headers, token):
     return metadata_list
 
 
-def fetch_all_reviews_metadata(identifier, agent_name, token=None, start_from_date=None, year=None, exclude_dates=None):
+def fetch_all_reviews_metadata(identifier, agent_name, token=None, start_from_date=None, exclude_dates=None):
     """
     Fetch PR reviews associated with a GitHub user or bot for the past 6 months.
     Returns lightweight metadata instead of full review objects.
@@ -600,7 +600,6 @@ def fetch_all_reviews_metadata(identifier, agent_name, token=None, start_from_da
         agent_name: Human-readable name of the agent for metadata purposes
         token: GitHub API token for authentication
         start_from_date: Only fetch reviews created after this date (for incremental updates)
-        year: Year parameter (deprecated, retained for compatibility but not utilized)
         exclude_dates: Set of date objects to exclude from mining (dates that have already been processed)
 
     Returns:
@@ -756,7 +755,7 @@ def calculate_review_stats_from_metadata(metadata_list):
 def calculate_monthly_metrics_by_agent():
     """
     Calculate monthly metrics for all agents for visualization.
-    Loads data directly from SWE-Arena/review_metadata dataset for the current year.
+    Loads data directly from SWE-Arena/review_metadata dataset.
 
     Returns:
         dict: {
@@ -1624,10 +1623,10 @@ def update_all_agents_incremental():
 
             # Load ALL metadata to calculate stats (aggregates entire last 6 months)
             print(f"📊 Calculating statistics from ALL stored metadata (last 6 months)...")
-            all_year_metadata = load_review_metadata()
+            all_metadata = load_review_metadata()
 
             # Filter for this specific agent
-            agent_metadata = [review for review in all_year_metadata if review.get("agent_identifier") == identifier]
+            agent_metadata = [review for review in all_metadata if review.get("agent_identifier") == identifier]
 
             # Calculate stats from metadata
             stats = calculate_review_stats_from_metadata(agent_metadata)
@@ -1665,7 +1664,7 @@ def construct_leaderboard_from_metadata():
         print("No agents found")
         return {}
 
-    # Load all review metadata for current year
+    # Load all review metadata
     all_metadata = load_review_metadata()
 
     cache_dict = {}
