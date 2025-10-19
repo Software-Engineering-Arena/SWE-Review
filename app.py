@@ -584,132 +584,6 @@ def update_pr_status(metadata_list, headers, token):
     return metadata_list
 
 
-def fetch_all_reviews_metadata(identifier, agent_name, token=None, start_from_date=None, exclude_dates=None):
-    """
-    Fetch PR reviews associated with a GitHub user or bot for the past 6 months.
-    Returns lightweight metadata instead of full review objects.
-
-    This function employs time-based partitioning to navigate GitHub's 1000-result limit per query.
-    It searches using the query pattern:
-    - reviewed-by:{identifier} (PR reviews by the agent)
-
-    After fetching reviews, it updates PR status to determine if PRs were merged or closed.
-
-    Args:
-        identifier: GitHub username or bot identifier
-        agent_name: Human-readable name of the agent for metadata purposes
-        token: GitHub API token for authentication
-        start_from_date: Only fetch reviews created after this date (for incremental updates)
-        exclude_dates: Set of date objects to exclude from mining (dates that have already been processed)
-
-    Returns:
-        List of dictionaries containing minimal PR review metadata with PR status
-    """
-    headers = {'Authorization': f'token {token}'} if token else {}
-
-    # Debug mode: limit review retrieval for testing
-    debug_limit_per_pattern = 10 if DEBUG_MODE else None
-
-    if DEBUG_MODE:
-        print(f"\n🐛 DEBUG MODE ENABLED: Limiting to {debug_limit_per_pattern} reviews per query pattern")
-
-    # Define query pattern for PR reviews:
-    query_patterns = []
-
-    # Add reviewed-by pattern for PR reviews
-    query_patterns.append(f'is:pr reviewed-by:{identifier}')
-
-    # Use a dict to deduplicate PRs by URL
-    prs_by_url = {}
-
-    # Define time range: past 6 months only (or from start_from_date if specified)
-    current_time = datetime.now(timezone.utc)
-    six_months_ago = current_time - timedelta(days=180)  # ~6 months
-
-    if start_from_date:
-        # Use start_from_date but ensure it's not older than 6 months
-        start_date = max(start_from_date, six_months_ago)
-    else:
-        start_date = six_months_ago
-
-    # End date is current time
-    end_date = current_time
-
-    for query_pattern in query_patterns:
-        print(f"\n🔍 Searching with query: {query_pattern}")
-        print(f"   Time range: {start_date.strftime('%Y-%m-%d')} to {end_date.strftime('%Y-%m-%d')}")
-
-        pattern_start_time = time.time()
-        initial_count = len(prs_by_url)
-
-        # Fetch with time partitioning
-        reviews_found = fetch_reviews_with_time_partition(
-            query_pattern,
-            start_date,
-            end_date,
-            headers,
-            prs_by_url,
-            debug_limit_per_pattern
-        )
-
-        pattern_duration = time.time() - pattern_start_time
-        new_reviews = len(prs_by_url) - initial_count
-
-        print(f"   ✓ Pattern complete: {new_reviews} new PRs found ({reviews_found} total fetched, {len(prs_by_url) - initial_count - (reviews_found - new_reviews)} duplicates)")
-        print(f"   ⏱️ Time taken: {pattern_duration:.1f} seconds")
-
-        # Delay between different query patterns (shorter in debug mode)
-        time.sleep(0.2 if DEBUG_MODE else 1.0)
-
-    # Convert to lightweight metadata
-    all_prs = list(prs_by_url.values())
-
-    # Filter out PRs from excluded dates if specified
-    if exclude_dates:
-        filtered_prs = []
-        excluded_count = 0
-        for pr in all_prs:
-            created_at = pr.get('created_at')
-            if created_at:
-                try:
-                    dt = datetime.fromisoformat(created_at.replace('Z', '+00:00'))
-                    pr_date = dt.date()
-                    if pr_date not in exclude_dates:
-                        filtered_prs.append(pr)
-                    else:
-                        excluded_count += 1
-                except Exception:
-                    filtered_prs.append(pr)  # Keep PRs with unparseable dates
-            else:
-                filtered_prs.append(pr)  # Keep PRs without created_at
-
-        if excluded_count > 0:
-            print(f"   ⏭️ Skipped {excluded_count} PRs from already-mined dates")
-        all_prs = filtered_prs
-
-    if DEBUG_MODE:
-        print(f"\n✅ COMPLETE (DEBUG MODE): Found {len(all_prs)} unique PRs reviewed by {identifier}")
-        print(f"   Note: In production mode, this would fetch ALL PRs")
-    else:
-        print(f"\n✅ COMPLETE: Found {len(all_prs)} unique PRs reviewed by {identifier}")
-    print(f"📦 Extracting minimal metadata and updating PR status...")
-
-    # Extract metadata for each PR review
-    metadata_list = [extract_review_metadata(pr) for pr in all_prs]
-
-    # Update PR status to get current merged/closed state
-    print(f"🔍 Updating PR status for reviewed PRs...")
-    metadata_list = update_pr_status(metadata_list, headers, token)
-
-    # Calculate memory savings
-    import sys
-    original_size = sys.getsizeof(str(all_prs))
-    metadata_size = sys.getsizeof(str(metadata_list))
-    savings_pct = ((original_size - metadata_size) / original_size * 100) if original_size > 0 else 0
-
-    print(f"💾 Memory efficiency: {original_size // 1024}KB → {metadata_size // 1024}KB (saved {savings_pct:.1f}%)")
-
-    return metadata_list
 
 
 def calculate_review_stats_from_metadata(metadata_list):
@@ -1197,59 +1071,6 @@ def get_daily_files_last_n_months(agent_identifier, n_months=6):
         return []
 
 
-def get_already_mined_dates(agent_identifier, n_months=6):
-    """
-    Get set of dates that have already been mined for an agent.
-
-    Args:
-        agent_identifier: GitHub identifier of the agent
-        n_months: Number of months to look back (default: 6)
-
-    Returns:
-        Set of date objects (datetime.date) that already have data files
-    """
-    try:
-        api = HfApi()
-
-        # Calculate date range
-        today = datetime.now(timezone.utc)
-        n_months_ago = today - timedelta(days=30 * n_months)
-
-        # List all files in the repository
-        files = api.list_repo_files(repo_id=REVIEW_METADATA_REPO, repo_type="dataset")
-
-        # Filter for files in this agent's folder
-        agent_pattern = f"{agent_identifier}/"
-        agent_files = [f for f in files if f.startswith(agent_pattern) and f.endswith('.jsonl')]
-
-        mined_dates = set()
-        for filename in agent_files:
-            try:
-                # Extract date from filename: [agent_identifier]/YYYY.MM.DD.jsonl
-                parts = filename.split('/')
-                if len(parts) != 2:
-                    continue
-
-                date_part = parts[1].replace('.jsonl', '')  # Get YYYY.MM.DD
-                date_components = date_part.split('.')
-                if len(date_components) != 3:
-                    continue
-
-                file_year, file_month, file_day = map(int, date_components)
-                file_date = datetime(file_year, file_month, file_day, tzinfo=timezone.utc).date()
-
-                # Only include dates within the last n_months
-                if n_months_ago.date() <= file_date <= today.date():
-                    mined_dates.add(file_date)
-            except Exception as e:
-                print(f"   Warning: Could not parse date from filename {filename}: {e}")
-                continue
-
-        return mined_dates
-
-    except Exception as e:
-        print(f"   Warning: Could not get already-mined dates for {agent_identifier}: {str(e)}")
-        return set()
 
 
 def fetch_review_current_status(review_url, token):
@@ -1554,98 +1375,39 @@ def save_agent_to_hf(data):
 
 def update_all_agents_incremental():
     """
-    Comprehensive update of review statistics for all agents.
+    Daily scheduled task for incremental review mining and statistics update.
 
     Strategy:
-    1. For each agent, re-mine ALL reviews within the 6-month window
-    2. This ensures review metadata is always fresh and up-to-date
-    3. Critical for catching status changes (closed/reverted PRs)
-    4. Overwrites existing day files with current data from GitHub API
-    5. Store minimal metadata (not full review objects) to avoid storage limits
-    6. Construct leaderboard from ALL stored metadata (last 6 months)
-
-    Note: Unlike the old approach, this does NOT skip already-mined dates.
-    This is essential to prevent stale metadata (e.g., reviews closed after initial mining).
-
-    Returns dictionary of all agent data with current stats.
+    1. Update PR status for all existing metadata (last LEADERBOARD_TIME_FRAME_DAYS - 1)
+    2. Fetch yesterday's new reviews
+    3. Save all updated/new metadata back to HuggingFace
+    4. Reload statistics from updated metadata
     """
-    token = get_github_token()
+    print(f"\n{'='*80}")
+    print(f"🕛 Daily Incremental Update started at {datetime.now(timezone.utc).isoformat()}")
+    print(f"{'='*80}")
 
-    # Load agent metadata from HuggingFace
-    agents = load_agents_from_hf()
-    if not agents:
-        print("No agents found in HuggingFace dataset")
-        return {}
+    try:
+        # Fetch and update reviews
+        fetch_and_update_daily_reviews()
 
-    cache_dict = {}
+        # Reload statistics from updated metadata
+        print(f"\n📋 Reloading statistics from updated review metadata...")
+        construct_leaderboard_from_metadata()
 
-    # Update each agent
-    for agent in agents:
-        identifier = agent.get('github_identifier')
-        agent_name = agent.get('agent_name', 'Unknown')
+        print(f"\n{'='*80}")
+        print(f"📊 Update Summary:")
+        print(f"   ✓ Updated existing review statuses")
+        print(f"   ✓ Fetched yesterday's new reviews")
+        print(f"   ✓ Statistics reloaded")
+        print(f"{'='*80}")
 
-        if not identifier:
-            print(f"Warning: Skipping agent without identifier: {agent}")
-            continue
+        print(f"\n✅ Daily Incremental Update completed at {datetime.now(timezone.utc).isoformat()}")
 
-        try:
-            print(f"\n{'='*80}")
-            print(f"Processing: {agent_name} ({identifier})")
-            print(f"{'='*80}")
-
-            # Get already-mined dates for this agent (last 6 months)
-            already_mined_dates = get_already_mined_dates(identifier, n_months=6)
-
-            # Always re-mine ALL dates within 6-month window to ensure fresh data
-            # This is critical because review metadata can become stale:
-            # - PRs can be closed/reverted after initial mining
-            # - Status changes need to be captured in daily files
-            print(f"📅 Re-mining ALL dates within 6-month window (including {len(already_mined_dates)} existing dates)")
-            print(f"   This ensures all review metadata is up-to-date...")
-
-            # Fetch ALL reviews (no exclusions) to refresh metadata
-            new_metadata = fetch_all_reviews_metadata(
-                identifier,
-                agent_name,
-                token,
-                start_from_date=None,  # Use full 6-month range
-                exclude_dates=None  # DO NOT exclude - always refresh everything
-            )
-
-            if new_metadata:
-                # Save new metadata to HuggingFace (organized by agent_identifier/YYYY.MM.DD.jsonl)
-                print(f"💾 Saving {len(new_metadata)} new review records...")
-                save_review_metadata_to_hf(new_metadata, identifier)
-            else:
-                print(f"   No new reviews to save")
-
-            # Load ALL metadata to calculate stats (aggregates entire last 6 months)
-            print(f"📊 Calculating statistics from ALL stored metadata (last 6 months)...")
-            all_metadata = load_review_metadata()
-
-            # Filter for this specific agent
-            agent_metadata = [review for review in all_metadata if review.get("agent_identifier") == identifier]
-
-            # Calculate stats from metadata
-            stats = calculate_review_stats_from_metadata(agent_metadata)
-
-            # Merge metadata with stats
-            cache_dict[identifier] = {
-                'agent_name': agent_name,
-                'website': agent.get('website', 'N/A'),
-                'github_identifier': identifier,
-                **stats
-            }
-
-            print(f"✓ Updated {identifier}: {stats['total_reviews']} reviews, {stats['acceptance_rate']}% acceptance rate")
-
-        except Exception as e:
-            print(f"✗ Error updating {identifier}: {str(e)}")
-            import traceback
-            traceback.print_exc()
-            continue
-
-    return cache_dict
+    except Exception as e:
+        print(f"✗ Daily update failed: {str(e)}")
+        import traceback
+        traceback.print_exc()
 
 
 def construct_leaderboard_from_metadata():
@@ -1685,57 +1447,6 @@ def construct_leaderboard_from_metadata():
         }
 
     return cache_dict
-
-
-def initialize_data():
-    """
-    Initialize data on application startup.
-    Constructs leaderboard from review metadata.
-
-    In DEBUG MODE:
-    - If no data available, automatically mine up to 10 reviews per query per agent
-    - Does NOT save to HuggingFace datasets
-    """
-    print("🚀 Initializing leaderboard data...")
-
-    # Try constructing from review metadata (fast, memory-efficient)
-    print(f"📂 Checking {REVIEW_METADATA_REPO} for existing data...")
-    try:
-        cache_dict = construct_leaderboard_from_metadata()
-        # Check if there's actually meaningful data (at least one agent with reviews)
-        has_data = any(entry.get('total_reviews', 0) > 0 for entry in cache_dict.values())
-        if cache_dict and has_data:
-            print(f"✓ Found existing review metadata. Leaderboard constructed from {REVIEW_METADATA_REPO}")
-            return
-        else:
-            print(f"   No meaningful data found in {REVIEW_METADATA_REPO}")
-    except Exception as e:
-        print(f"   Could not construct from metadata: {e}")
-
-    # If in debug mode and no data available, mine immediately
-    if DEBUG_MODE:
-        print("\n🐛 DEBUG MODE: No data available, mining immediately (up to 10 reviews per query per agent)...")
-        agents = load_agents_from_hf()
-        if agents:
-            print(f"✓ Loaded {len(agents)} agents from HuggingFace")
-            print("⛏️ Mining GitHub data in debug mode (limited to 10 reviews per query)...")
-            cache_dict = update_all_agents_incremental()
-            print("✓ Debug mining complete (data NOT saved to HuggingFace)")
-            return
-        else:
-            print("⚠️ No agents found. Waiting for first submission...")
-            return
-
-    # Production mode: Fallback to full incremental mining from GitHub
-    agents = load_agents_from_hf()
-    if agents:
-        print(f"✓ Loaded {len(agents)} agents from HuggingFace")
-        print("⛏️ Mining GitHub data (this may take a while)...")
-        cache_dict = update_all_agents_incremental()
-        return
-
-    # No data available
-    print("⚠️ No data sources available. Waiting for first submission...")
 
 
 # =============================================================================
@@ -1953,72 +1664,131 @@ def submit_agent(identifier, agent_name, organization, description, website):
     if not save_agent_to_hf(submission):
         return "❌ Failed to save submission", get_leaderboard_dataframe(), create_monthly_metrics_plot()
 
-    # Fetch review metadata immediately (memory-efficient)
-    token = get_github_token()
-    try:
-        print(f"Fetching review metadata for {agent_name}...")
-
-        # Fetch lightweight metadata
-        metadata_list = fetch_all_reviews_metadata(identifier, agent_name, token)
-
-        if metadata_list:
-            # Save metadata to HuggingFace
-            save_review_metadata_to_hf(metadata_list, identifier)
-
-        # Calculate stats from metadata
-        stats = calculate_review_stats_from_metadata(metadata_list)
-
-        return f"✅ Successfully submitted {agent_name}! Stats: {stats['total_reviews']} reviews, {stats['acceptance_rate']}% acceptance rate", get_leaderboard_dataframe(), create_monthly_metrics_plot()
-
-    except Exception as e:
-        error_msg = f"⚠️ Submitted {agent_name}, but failed to fetch review data: {str(e)}"
-        print(error_msg)
-        import traceback
-        traceback.print_exc()
-        return error_msg, get_leaderboard_dataframe(), create_monthly_metrics_plot()
+    # Return success message - data will be populated by daily incremental updates
+    return f"✅ Successfully submitted {agent_name}! Review data will be populated by the next daily incremental update.", get_leaderboard_dataframe(), create_monthly_metrics_plot()
 
 
 # =============================================================================
 # BACKGROUND TASKS
 # =============================================================================
 
-def daily_update_task():
+def fetch_and_update_daily_reviews():
     """
-    Daily scheduled task (runs at 12:00 AM UTC) for comprehensive review mining.
+    Fetch and update reviews with comprehensive status checking.
 
     Strategy:
-    1. Re-mine ALL reviews within the 6-month window for all agents
-    2. This ensures review metadata is always fresh, catching:
-       - PRs that were closed/reverted since last mining
-       - Status changes (is_closed, state_reason, closed_at)
-       - Any other metadata updates
-    3. Updates ALL day files within LEADERBOARD_TIME_FRAME_DAYS
-
-    Unlike the old selective refresh approach, this guarantees no stale data.
+    1. For each agent:
+       - Examine ALL open reviews from last LEADERBOARD_TIME_FRAME_DAYS - 1 for their closed_at status
+       - Update PR status for all existing metadata (last LEADERBOARD_TIME_FRAME_DAYS - 1)
+       - Fetch new reviews from yesterday 12am to today 12am
+       - Save all updated/new metadata back to HuggingFace
     """
-    print(f"\n{'='*80}")
-    print(f"🕛 Daily Regular Mining started at {datetime.now(timezone.utc).isoformat()}")
-    print(f"{'='*80}")
+    token = get_github_token()
+    headers = {'Authorization': f'token {token}'} if token else {}
 
-    try:
-        # Run full incremental update for all agents
-        # This will re-mine everything in the 6-month window
-        print(f"📋 Starting comprehensive re-mining of all agents (6-month window)...")
+    # Load all agents
+    agents = load_agents_from_hf()
+    if not agents:
+        print("No agents found in HuggingFace dataset")
+        return
 
-        update_all_agents_incremental()
+    # Calculate date range
+    today_utc = datetime.now(timezone.utc)
+    today_midnight = datetime.combine(today_utc.date(), datetime.min.time(), tzinfo=timezone.utc)
+    yesterday_midnight = today_midnight - timedelta(days=1)
+    cutoff_date = today_midnight - timedelta(days=LEADERBOARD_TIME_FRAME_DAYS - 1)
 
-        print(f"\n{'='*80}")
-        print(f"📊 Mining Summary:")
-        print(f"   All agents re-mined successfully within 6-month window")
-        print(f"   All review metadata refreshed and up-to-date")
-        print(f"{'='*80}")
+    print(f"📅 Time Range Configuration:")
+    print(f"   Yesterday 12am UTC: {yesterday_midnight.isoformat()}")
+    print(f"   Today 12am UTC: {today_midnight.isoformat()}")
+    print(f"   Cutoff for existing reviews: {cutoff_date.isoformat()}")
+    print(f"   Examining reviews from: {cutoff_date.date()} to {today_midnight.date()}")
 
-        print(f"\n✅ Daily Regular Mining completed at {datetime.now(timezone.utc).isoformat()}")
+    for agent in agents:
+        identifier = agent.get('github_identifier')
+        agent_name = agent.get('agent_name', 'Unknown')
 
-    except Exception as e:
-        print(f"✗ Daily update failed: {str(e)}")
-        import traceback
-        traceback.print_exc()
+        if not identifier:
+            print(f"Warning: Skipping agent without identifier: {agent}")
+            continue
+
+        try:
+            print(f"\n{'='*60}")
+            print(f"Processing: {agent_name} ({identifier})")
+            print(f"{'='*60}")
+
+            # Step 1: Load all existing metadata within timeframe
+            print(f"📊 Loading existing metadata from last {LEADERBOARD_TIME_FRAME_DAYS - 1} days...")
+            all_metadata = load_review_metadata()
+            agent_metadata = [r for r in all_metadata if r.get("agent_identifier") == identifier]
+
+            # Filter to last LEADERBOARD_TIME_FRAME_DAYS - 1 days (from cutoff to today)
+            recent_metadata = []
+            for review in agent_metadata:
+                reviewed_at = review.get('reviewed_at', '')
+                if reviewed_at:
+                    try:
+                        review_date = datetime.fromisoformat(reviewed_at.replace('Z', '+00:00'))
+                        if cutoff_date <= review_date < today_midnight:
+                            recent_metadata.append(review)
+                    except Exception as e:
+                        print(f"   Warning: Could not parse date '{reviewed_at}': {e}")
+                        continue
+
+            print(f"   ✓ Loaded {len(recent_metadata)} existing reviews from timeframe")
+
+            # Step 2: Examine ALL open reviews for their closed_at status
+            # This ensures we capture any reviews that may have been closed/merged since last check
+            if recent_metadata:
+                print(f"🔍 Examining {len(recent_metadata)} open reviews for status updates (checking closed_at)...")
+                recent_metadata = update_pr_status(recent_metadata, headers, token)
+                print(f"   ✓ Updated PR status for existing reviews")
+
+            # Step 3: Fetch NEW reviews from yesterday 12am to today 12am
+            print(f"🔍 Fetching new reviews from {yesterday_midnight.isoformat()} to {today_midnight.isoformat()}...")
+            
+            base_query = f'is:pr review:approved author:{identifier} -is:draft'
+            prs_by_url = {}
+
+            fetch_reviews_with_time_partition(
+                base_query,
+                yesterday_midnight,
+                today_midnight,
+                headers,
+                prs_by_url,
+                debug_limit=None
+            )
+
+            # Extract metadata for new reviews
+            yesterday_metadata = []
+            for pr_url, pr in prs_by_url.items():
+                metadata = extract_review_metadata(pr)
+                if metadata:
+                    metadata['agent_identifier'] = identifier
+                    yesterday_metadata.append(metadata)
+
+            print(f"   ✓ Found {len(yesterday_metadata)} new reviews in 24-hour window")
+
+            # Step 4: Update PR status for new reviews
+            if yesterday_metadata:
+                print(f"   Updating PR status for {len(yesterday_metadata)} new reviews...")
+                yesterday_metadata = update_pr_status(yesterday_metadata, headers, token)
+
+            # Step 5: Combine and save all metadata
+            all_updated_metadata = recent_metadata + yesterday_metadata
+
+            if all_updated_metadata:
+                print(f"💾 Saving {len(all_updated_metadata)} total reviews to HuggingFace...")
+                save_review_metadata_to_hf(all_updated_metadata, identifier)
+                print(f"✓ Updated {identifier}: {len(recent_metadata)} existing (status checked) + {len(yesterday_metadata)} new = {len(all_updated_metadata)} total")
+            else:
+                print(f"   No reviews to save for {identifier}")
+
+        except Exception as e:
+            print(f"✗ Error processing {identifier}: {str(e)}")
+            import traceback
+            traceback.print_exc()
+            continue
 
 
 # =============================================================================
@@ -2047,19 +1817,17 @@ else:
         print("   (Explicitly set via '--no-debug' flag)")
     print()
 
-initialize_data()
-
 # Start APScheduler for daily updates at 12:00 AM UTC
 scheduler = BackgroundScheduler(timezone="UTC")
 scheduler.add_job(
-    daily_update_task,
+    update_all_agents_incremental,
     trigger=CronTrigger(hour=0, minute=0),  # 12:00 AM UTC daily
     id='daily_review_mining',
     name='Daily Regular Review Mining',
     replace_existing=True
 )
 scheduler.start()
-print("✓ Scheduler started: Daily Regular Mining at 12:00 AM UTC (re-mines all reviews within 6-month window)")
+print("✓ Scheduler started: Daily Incremental Update at 12:00 AM UTC (updates existing metadata + mines yesterday's reviews)")
 
 # Create Gradio interface
 with gr.Blocks(title="SWE Agent Review Leaderboard", theme=gr.themes.Soft()) as app:
