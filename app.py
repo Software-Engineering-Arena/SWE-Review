@@ -793,12 +793,16 @@ def save_review_metadata_to_hf(metadata_list, agent_identifier):
     Each file is stored in the agent's folder and named YYYY.MM.DD.jsonl for that day's reviews.
     In debug mode, saves to in-memory cache only.
 
-    This function APPENDS new metadata and DEDUPLICATES by sha.
+    This function APPENDS new metadata and DEDUPLICATES by review_id.
+    Uses batch upload to avoid rate limit (uploads entire folder in single commit).
 
     Args:
         metadata_list: List of review metadata dictionaries
         agent_identifier: GitHub identifier of the agent (used as folder name)
     """
+    import tempfile
+    import shutil
+
     # Skip saving to HF in debug mode - use in-memory cache instead
     if DEBUG_MODE:
         global DEBUG_REVIEW_METADATA_CACHE
@@ -820,57 +824,67 @@ def save_review_metadata_to_hf(metadata_list, agent_identifier):
         # Group by exact date (year, month, day)
         grouped = group_metadata_by_date(metadata_list)
 
-        for (review_year, month, day), day_metadata in grouped.items():
-            # New structure: [agent_identifier]/YYYY.MM.DD.jsonl
-            filename = f"{agent_identifier}/{review_year}.{month:02d}.{day:02d}.jsonl"
-            local_filename = f"{review_year}.{month:02d}.{day:02d}.jsonl"
-            print(f"📤 Uploading {len(day_metadata)} reviews to {filename}...")
+        # Create a temporary directory for batch upload
+        temp_dir = tempfile.mkdtemp()
+        agent_folder = os.path.join(temp_dir, agent_identifier)
+        os.makedirs(agent_folder, exist_ok=True)
 
-            # Download existing file if it exists
-            existing_metadata = []
-            try:
-                file_path = hf_hub_download(
-                    repo_id=REVIEW_METADATA_REPO,
-                    filename=filename,
-                    repo_type="dataset",
-                    token=token
-                )
-                existing_metadata = load_jsonl(file_path)
-                print(f"   Found {len(existing_metadata)} existing reviews in {filename}")
-            except Exception:
-                print(f"   No existing file found for {filename}, creating new")
+        try:
+            print(f"📦 Preparing batch upload for {len(grouped)} daily files...")
 
-            # Merge and deduplicate by review_id
-            existing_by_id = {meta['review_id']: meta for meta in existing_metadata if meta.get('review_id')}
-            new_by_id = {meta['review_id']: meta for meta in day_metadata if meta.get('review_id')}
+            # Process each daily file
+            for (review_year, month, day), day_metadata in grouped.items():
+                filename = f"{agent_identifier}/{review_year}.{month:02d}.{day:02d}.jsonl"
+                local_filename = os.path.join(agent_folder, f"{review_year}.{month:02d}.{day:02d}.jsonl")
 
-            # Update with new data (new data overwrites old)
-            existing_by_id.update(new_by_id)
-            merged_metadata = list(existing_by_id.values())
+                # Download existing file if it exists
+                existing_metadata = []
+                try:
+                    file_path = hf_hub_download(
+                        repo_id=REVIEW_METADATA_REPO,
+                        filename=filename,
+                        repo_type="dataset",
+                        token=token
+                    )
+                    existing_metadata = load_jsonl(file_path)
+                    print(f"   Found {len(existing_metadata)} existing reviews in {filename}")
+                except Exception:
+                    print(f"   Creating new file: {filename}")
 
-            # Save locally
-            save_jsonl(local_filename, merged_metadata)
+                # Merge and deduplicate by review_id
+                existing_by_id = {meta['review_id']: meta for meta in existing_metadata if meta.get('review_id')}
+                new_by_id = {meta['review_id']: meta for meta in day_metadata if meta.get('review_id')}
 
-            try:
-                # Upload to HuggingFace with folder path
-                upload_with_retry(
-                    api=api,
-                    path_or_fileobj=local_filename,
-                    path_in_repo=filename,
-                    repo_id=REVIEW_METADATA_REPO,
-                    repo_type="dataset",
-                    token=token
-                )
-                print(f"   ✓ Saved {len(merged_metadata)} total reviews to {filename}")
-            finally:
-                # Always clean up local file, even if upload fails
-                if os.path.exists(local_filename):
-                    os.remove(local_filename)
+                # Update with new data (new data overwrites old)
+                existing_by_id.update(new_by_id)
+                merged_metadata = list(existing_by_id.values())
 
-        return True
+                # Save to temp directory
+                save_jsonl(local_filename, merged_metadata)
+                print(f"   Prepared {len(merged_metadata)} reviews for {filename}")
+
+            # Upload entire folder in a single commit
+            print(f"📤 Uploading {len(grouped)} files in single batch commit...")
+            api.upload_folder(
+                folder_path=temp_dir,
+                repo_id=REVIEW_METADATA_REPO,
+                repo_type="dataset",
+                token=token,
+                commit_message=f"Batch update: {agent_identifier} ({len(grouped)} daily files)"
+            )
+            print(f"   ✓ Batch upload complete for {agent_identifier}")
+
+            return True
+
+        finally:
+            # Always clean up temp directory
+            if os.path.exists(temp_dir):
+                shutil.rmtree(temp_dir)
 
     except Exception as e:
         print(f"✗ Error saving review metadata: {str(e)}")
+        import traceback
+        traceback.print_exc()
         return False
 
 
