@@ -52,12 +52,42 @@ def save_jsonl(filename, data):
             f.write(json.dumps(item) + '\n')
 
 
-def get_github_token():
-    """Get GitHub token from environment variables."""
-    token = os.getenv('GITHUB_TOKEN')
-    if not token:
-        print("Warning: GITHUB_TOKEN not found. API rate limits: 60/hour (authenticated: 5000/hour)")
-    return token
+def get_github_tokens():
+    """Get all GitHub tokens from environment variables (all vars starting with GITHUB_TOKEN)."""
+    tokens = []
+    for key, value in os.environ.items():
+        if key.startswith('GITHUB_TOKEN') and value:
+            tokens.append(value)
+
+    if not tokens:
+        print("Warning: No GITHUB_TOKEN found. API rate limits: 60/hour (authenticated: 5000/hour)")
+    else:
+        print(f"✓ Loaded {len(tokens)} GitHub token(s) for rotation")
+
+    return tokens
+
+
+class TokenPool:
+    """
+    Manages a pool of GitHub tokens for load balancing across rate limits.
+    Rotates through tokens in round-robin fashion to distribute API calls.
+    """
+    def __init__(self, tokens):
+        self.tokens = tokens if tokens else [None]
+        self.current_index = 0
+
+    def get_next_token(self):
+        """Get the next token in round-robin order."""
+        if not self.tokens:
+            return None
+        token = self.tokens[self.current_index]
+        self.current_index = (self.current_index + 1) % len(self.tokens)
+        return token
+
+    def get_headers(self):
+        """Get headers with the next token in rotation."""
+        token = self.get_next_token()
+        return {'Authorization': f'token {token}'} if token else {}
 
 
 def get_hf_token():
@@ -144,7 +174,7 @@ def request_with_backoff(method, url, *, headers=None, params=None, json_body=No
     return None
 
 
-def fetch_reviews_with_time_partition(base_query, start_date, end_date, headers, prs_by_url, depth=0):
+def fetch_reviews_with_time_partition(base_query, start_date, end_date, token_pool, prs_by_url, depth=0):
     """
     Fetch reviews within a specific time range using time-based partitioning.
     Recursively splits the time range if hitting the 1000-result limit.
@@ -193,10 +223,10 @@ def fetch_reviews_with_time_partition(base_query, start_date, end_date, headers,
             'sort': 'created',
             'order': 'asc'
         }
-        headers_with_accept = headers.copy() if headers else {}
+        headers = token_pool.get_headers()
 
         try:
-            response = request_with_backoff('GET', url, headers=headers_with_accept, params=params)
+            response = request_with_backoff('GET', url, headers=headers, params=params)
             if response is None:
                 print(f"{indent}  Error: retries exhausted for range {start_str} to {end_str}")
                 return total_in_partition
@@ -241,7 +271,7 @@ def fetch_reviews_with_time_partition(base_query, start_date, end_date, headers,
                             split_start = split_start + timedelta(seconds=1)
 
                         count = fetch_reviews_with_time_partition(
-                            base_query, split_start, split_end, headers, prs_by_url, depth + 1
+                            base_query, split_start, split_end, token_pool, prs_by_url, depth + 1
                         )
                         total_from_splits += count
 
@@ -260,7 +290,7 @@ def fetch_reviews_with_time_partition(base_query, start_date, end_date, headers,
                             split_start = split_start + timedelta(minutes=1)
 
                         count = fetch_reviews_with_time_partition(
-                            base_query, split_start, split_end, headers, prs_by_url, depth + 1
+                            base_query, split_start, split_end, token_pool, prs_by_url, depth + 1
                         )
                         total_from_splits += count
 
@@ -279,7 +309,7 @@ def fetch_reviews_with_time_partition(base_query, start_date, end_date, headers,
                             split_start = split_start + timedelta(hours=1)
 
                         count = fetch_reviews_with_time_partition(
-                            base_query, split_start, split_end, headers, prs_by_url, depth + 1
+                            base_query, split_start, split_end, token_pool, prs_by_url, depth + 1
                         )
                         total_from_splits += count
 
@@ -308,7 +338,7 @@ def fetch_reviews_with_time_partition(base_query, start_date, end_date, headers,
                                 split_start = split_start + timedelta(days=1)
 
                             count = fetch_reviews_with_time_partition(
-                                base_query, split_start, split_end, headers, prs_by_url, depth + 1
+                                base_query, split_start, split_end, token_pool, prs_by_url, depth + 1
                             )
                             total_from_splits += count
 
@@ -318,10 +348,10 @@ def fetch_reviews_with_time_partition(base_query, start_date, end_date, headers,
                         mid_date = start_date + time_diff / 2
 
                         count1 = fetch_reviews_with_time_partition(
-                            base_query, start_date, mid_date, headers, prs_by_url, depth + 1
+                            base_query, start_date, mid_date, token_pool, prs_by_url, depth + 1
                         )
                         count2 = fetch_reviews_with_time_partition(
-                            base_query, mid_date + timedelta(days=1), end_date, headers, prs_by_url, depth + 1
+                            base_query, mid_date + timedelta(days=1), end_date, token_pool, prs_by_url, depth + 1
                         )
 
                         return count1 + count2
@@ -382,7 +412,7 @@ def extract_review_metadata(pr):
     }
 
 
-def update_pr_status(metadata_list, headers, token):
+def update_pr_status(metadata_list, token_pool):
     """
     Update PR status for reviews to get current merged/closed state.
 
@@ -391,8 +421,7 @@ def update_pr_status(metadata_list, headers, token):
 
     Args:
         metadata_list: List of review metadata dictionaries
-        headers: HTTP headers for GitHub API
-        token: GitHub API token
+        token_pool: TokenPool instance for rotating tokens
 
     Returns:
         Updated metadata_list with current PR status
@@ -425,6 +454,7 @@ def update_pr_status(metadata_list, headers, token):
                 owner, repo, pull_word, pr_number = parts[0], parts[1], parts[2], parts[3]
                 api_url = f'https://api.github.com/repos/{owner}/{repo}/pulls/{pr_number}'
 
+                headers = token_pool.get_headers()
                 response = request_with_backoff('GET', api_url, headers=headers, max_retries=3)
 
                 if response and response.status_code == 200:
@@ -468,7 +498,7 @@ def update_pr_status(metadata_list, headers, token):
     return metadata_list
 
 
-def fetch_all_reviews_metadata(identifier, agent_name, token=None):
+def fetch_all_reviews_metadata(identifier, agent_name, token_pool):
     """
     Fetch PR reviews associated with a GitHub user or bot for the past LEADERBOARD_TIME_FRAME_DAYS.
     Returns lightweight metadata instead of full review objects.
@@ -482,12 +512,11 @@ def fetch_all_reviews_metadata(identifier, agent_name, token=None):
     Args:
         identifier: GitHub username or bot identifier
         agent_name: Human-readable name of the agent for metadata purposes
-        token: GitHub API token for authentication
+        token_pool: TokenPool instance for rotating tokens
 
     Returns:
         List of dictionaries containing minimal PR review metadata with PR status
     """
-    headers = {'Authorization': f'token {token}'} if token else {}
 
     # Define query pattern for PR reviews
     query_patterns = [f'is:pr reviewed-by:{identifier}']
@@ -512,7 +541,7 @@ def fetch_all_reviews_metadata(identifier, agent_name, token=None):
             query_pattern,
             start_date,
             end_date,
-            headers,
+            token_pool,
             prs_by_url
         )
 
@@ -534,7 +563,7 @@ def fetch_all_reviews_metadata(identifier, agent_name, token=None):
 
     # Update PR status to get current merged/closed state
     print(f"🔍 Updating PR status for reviewed PRs...")
-    metadata_list = update_pr_status(metadata_list, headers, token)
+    metadata_list = update_pr_status(metadata_list, token_pool)
 
     # Calculate memory savings
     import sys
@@ -725,7 +754,8 @@ def mine_all_agents():
     """
     Mine review metadata for all agents within LEADERBOARD_TIME_FRAME_DAYS and save to HuggingFace.
     """
-    token = get_github_token()
+    tokens = get_github_tokens()
+    token_pool = TokenPool(tokens)
 
     # Load agent metadata from HuggingFace
     agents = load_agents_from_hf()
@@ -753,7 +783,7 @@ def mine_all_agents():
             print(f"{'='*80}")
 
             # Fetch review metadata
-            metadata = fetch_all_reviews_metadata(identifier, agent_name, token)
+            metadata = fetch_all_reviews_metadata(identifier, agent_name, token_pool)
 
             if metadata:
                 print(f"💾 Saving {len(metadata)} review records...")
