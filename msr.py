@@ -69,25 +69,179 @@ def get_github_tokens():
 
 class TokenPool:
     """
-    Manages a pool of GitHub tokens for load balancing across rate limits.
-    Rotates through tokens in round-robin fashion to distribute API calls.
+    Hybrid token pool with parallel execution and round-robin fallback.
+
+    Splits tokens into two pools:
+    - Parallel pool (50%): For concurrent API calls to maximize throughput
+    - Round-robin pool (50%): Backup pool for rate limit fallback
+
+    Features:
+    - Automatic fallback when parallel tokens hit rate limits
+    - Rate limit tracking with timestamp-based recovery
+    - Thread-safe token management
+    - Real-time statistics monitoring
     """
     def __init__(self, tokens):
-        self.tokens = tokens if tokens else [None]
-        self.current_index = 0
+        import threading
+
+        self.all_tokens = tokens if tokens else [None]
+        self.lock = threading.Lock()
+
+        # Split tokens into parallel and round-robin pools (50/50)
+        total_tokens = len(self.all_tokens)
+        split_point = max(1, total_tokens // 2)
+
+        self.parallel_tokens = self.all_tokens[:split_point]
+        self.roundrobin_tokens = self.all_tokens[split_point:] if total_tokens > 1 else self.all_tokens
+
+        # Round-robin index for fallback pool
+        self.roundrobin_index = 0
+
+        # Rate limit tracking: {token: reset_timestamp}
+        self.parallel_rate_limited = set()
+        self.roundrobin_rate_limited = set()
+        self.rate_limit_resets = {}
+
+        # Statistics
+        self.stats = {
+            'parallel_calls': 0,
+            'roundrobin_calls': 0,
+            'fallback_triggers': 0
+        }
+
+        print(f"📊 Token Pool Initialized:")
+        print(f"   Total tokens: {total_tokens}")
+        print(f"   Parallel pool: {len(self.parallel_tokens)} tokens")
+        print(f"   Round-robin pool: {len(self.roundrobin_tokens)} tokens")
+
+    def _cleanup_expired_rate_limits(self):
+        """Remove tokens from rate-limited sets if their reset time has passed."""
+        current_time = time.time()
+        expired_tokens = [
+            token for token, reset_time in self.rate_limit_resets.items()
+            if current_time >= reset_time
+        ]
+
+        for token in expired_tokens:
+            self.parallel_rate_limited.discard(token)
+            self.roundrobin_rate_limited.discard(token)
+            del self.rate_limit_resets[token]
+            if expired_tokens:
+                print(f"   ✓ Recovered {len(expired_tokens)} token(s) from rate limit")
+
+    def get_parallel_token(self):
+        """Get an available token from the parallel pool."""
+        with self.lock:
+            self._cleanup_expired_rate_limits()
+
+            # Find first non-rate-limited parallel token
+            for token in self.parallel_tokens:
+                if token not in self.parallel_rate_limited:
+                    self.stats['parallel_calls'] += 1
+                    return token
+
+            return None
+
+    def get_roundrobin_token(self):
+        """Get the next available token from round-robin pool."""
+        with self.lock:
+            self._cleanup_expired_rate_limits()
+
+            # Try all tokens in round-robin order
+            attempts = 0
+            while attempts < len(self.roundrobin_tokens):
+                token = self.roundrobin_tokens[self.roundrobin_index]
+                self.roundrobin_index = (self.roundrobin_index + 1) % len(self.roundrobin_tokens)
+
+                if token not in self.roundrobin_rate_limited:
+                    self.stats['roundrobin_calls'] += 1
+                    return token
+
+                attempts += 1
+
+            return None
 
     def get_next_token(self):
-        """Get the next token in round-robin order."""
-        if not self.tokens:
-            return None
-        token = self.tokens[self.current_index]
-        self.current_index = (self.current_index + 1) % len(self.tokens)
+        """
+        Get next available token, trying parallel pool first, then falling back to round-robin.
+
+        Returns:
+            Token string or None if all tokens are rate-limited
+        """
+        # Try parallel pool first
+        token = self.get_parallel_token()
+        if token:
+            return token
+
+        # Fallback to round-robin pool
+        with self.lock:
+            self.stats['fallback_triggers'] += 1
+
+        token = self.get_roundrobin_token()
+        if not token:
+            print("   ⚠️ All tokens are rate-limited, waiting...")
+
         return token
 
     def get_headers(self):
-        """Get headers with the next token in rotation."""
+        """Get headers with the next available token."""
         token = self.get_next_token()
         return {'Authorization': f'token {token}'} if token else {}
+
+    def mark_rate_limited(self, token, reset_timestamp=None):
+        """
+        Mark a token as rate-limited with optional reset timestamp.
+
+        Args:
+            token: The token to mark as rate-limited
+            reset_timestamp: Unix timestamp when rate limit resets (optional)
+        """
+        if not token:
+            return
+
+        with self.lock:
+            # Determine which pool the token belongs to
+            if token in self.parallel_tokens:
+                self.parallel_rate_limited.add(token)
+            if token in self.roundrobin_tokens:
+                self.roundrobin_rate_limited.add(token)
+
+            # Store reset timestamp if provided
+            if reset_timestamp:
+                self.rate_limit_resets[token] = reset_timestamp
+                from datetime import datetime, timezone
+                reset_time = datetime.fromtimestamp(reset_timestamp, tz=timezone.utc)
+                print(f"   ⏰ Token rate-limited until {reset_time.strftime('%H:%M:%S')} UTC")
+
+    def get_available_parallel_tokens(self):
+        """Get list of all available (non-rate-limited) parallel tokens."""
+        with self.lock:
+            self._cleanup_expired_rate_limits()
+            return [t for t in self.parallel_tokens if t not in self.parallel_rate_limited]
+
+    def get_stats(self):
+        """Get token pool usage statistics."""
+        with self.lock:
+            return {
+                'parallel_calls': self.stats['parallel_calls'],
+                'roundrobin_calls': self.stats['roundrobin_calls'],
+                'fallback_triggers': self.stats['fallback_triggers'],
+                'parallel_rate_limited': len(self.parallel_rate_limited),
+                'roundrobin_rate_limited': len(self.roundrobin_rate_limited)
+            }
+
+    def print_stats(self):
+        """Print token pool usage statistics."""
+        stats = self.get_stats()
+        total_calls = stats['parallel_calls'] + stats['roundrobin_calls']
+
+        print(f"\n📊 Token Pool Statistics:")
+        print(f"   Total API calls: {total_calls}")
+        if total_calls > 0:
+            print(f"   Parallel calls: {stats['parallel_calls']} ({stats['parallel_calls']/total_calls*100:.1f}%)")
+            print(f"   Round-robin calls: {stats['roundrobin_calls']} ({stats['roundrobin_calls']/total_calls*100:.1f}%)")
+        print(f"   Fallback triggers: {stats['fallback_triggers']}")
+        print(f"   Currently rate-limited: {stats['parallel_rate_limited']} parallel, {stats['roundrobin_rate_limited']} round-robin")
 
 
 def get_hf_token():
@@ -102,10 +256,16 @@ def get_hf_token():
 # GITHUB API FUNCTIONS
 # =============================================================================
 
-def request_with_backoff(method, url, *, headers=None, params=None, json_body=None, data=None, max_retries=10, timeout=30):
+def request_with_backoff(method, url, *, headers=None, params=None, json_body=None, data=None, max_retries=10, timeout=30, token_pool=None, token=None):
     """
     Perform an HTTP request with exponential backoff and jitter for GitHub API.
     Retries on 403/429 (rate limits), 5xx server errors, and transient network exceptions.
+
+    Args:
+        token_pool: Optional TokenPool instance for rate limit tracking
+        token: Optional token string to mark as rate-limited if 403/429 occurs
+
+    Returns the final requests.Response on success or non-retryable status, or None after exhausting retries.
     """
     delay = 1.0
     for attempt in range(max_retries):
@@ -129,6 +289,7 @@ def request_with_backoff(method, url, *, headers=None, params=None, json_body=No
             # Rate limits or server errors -> retry with backoff
             if status in (403, 429) or 500 <= status < 600:
                 wait = None
+                reset_timestamp = None
 
                 # Prefer Retry-After when present
                 retry_after = resp.headers.get('Retry-After') or resp.headers.get('retry-after')
@@ -143,10 +304,14 @@ def request_with_backoff(method, url, *, headers=None, params=None, json_body=No
                     reset_hdr = resp.headers.get('X-RateLimit-Reset') or resp.headers.get('x-ratelimit-reset')
                     if reset_hdr:
                         try:
-                            reset_ts = int(float(reset_hdr))
-                            wait = max(reset_ts - time.time() + 2, 1)
+                            reset_timestamp = int(float(reset_hdr))
+                            wait = max(reset_timestamp - time.time() + 2, 1)
                         except Exception:
                             wait = None
+
+                # Mark token as rate-limited if we have token pool and token
+                if status in (403, 429) and token_pool and token:
+                    token_pool.mark_rate_limited(token, reset_timestamp)
 
                 # Final fallback: exponential backoff with jitter
                 if wait is None:
@@ -223,10 +388,11 @@ def fetch_reviews_with_time_partition(base_query, start_date, end_date, token_po
             'sort': 'created',
             'order': 'asc'
         }
-        headers = token_pool.get_headers()
+        token = token_pool.get_next_token()
+        headers = {'Authorization': f'token {token}'} if token else {}
 
         try:
-            response = request_with_backoff('GET', url, headers=headers, params=params)
+            response = request_with_backoff('GET', url, headers=headers, params=params, token_pool=token_pool, token=token)
             if response is None:
                 print(f"{indent}  Error: retries exhausted for range {start_str} to {end_str}")
                 return total_in_partition
@@ -373,6 +539,98 @@ def fetch_reviews_with_time_partition(base_query, start_date, end_date, token_po
     return total_in_partition
 
 
+def fetch_reviews_parallel(query_patterns, start_date, end_date, token_pool, prs_by_url):
+    """
+    Fetch reviews for multiple query patterns in parallel using available parallel tokens.
+
+    This function uses ThreadPoolExecutor to execute multiple query patterns concurrently,
+    with each pattern using a dedicated token from the parallel pool. Falls back to
+    sequential execution if insufficient parallel tokens are available.
+
+    Args:
+        query_patterns: List of query pattern strings (e.g., ['is:pr author:bot1', 'is:pr reviewed-by:bot1'])
+        start_date: Start datetime for time range
+        end_date: End datetime for time range
+        token_pool: TokenPool instance for token management
+        prs_by_url: Dictionary to collect PRs by URL (shared across patterns)
+
+    Returns:
+        Total number of PRs found across all patterns
+    """
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+    import threading
+
+    # Check how many parallel tokens are available
+    available_tokens = token_pool.get_available_parallel_tokens()
+
+    if len(available_tokens) < 2 or len(query_patterns) < 2:
+        # Not enough tokens or patterns for parallelization, use sequential
+        print(f"   ⚠️ Sequential execution: {len(available_tokens)} parallel tokens available for {len(query_patterns)} patterns")
+        total_found = 0
+        for pattern in query_patterns:
+            pattern_prs = {}
+            count = fetch_reviews_with_time_partition(
+                pattern, start_date, end_date, token_pool, pattern_prs, depth=0
+            )
+            # Merge pattern results into global dict
+            lock = threading.Lock()
+            with lock:
+                for url, pr in pattern_prs.items():
+                    if url not in prs_by_url:
+                        prs_by_url[url] = pr
+            total_found += count
+        return total_found
+
+    # Use parallel execution
+    print(f"   🚀 Parallel execution: {len(available_tokens)} parallel tokens for {len(query_patterns)} patterns")
+
+    # Thread-safe lock for updating prs_by_url
+    lock = threading.Lock()
+
+    def fetch_pattern(pattern):
+        """Fetch reviews for a single pattern (runs in parallel)."""
+        pattern_prs = {}
+        try:
+            count = fetch_reviews_with_time_partition(
+                pattern, start_date, end_date, token_pool, pattern_prs, depth=0
+            )
+            return pattern, pattern_prs, count
+        except Exception as e:
+            print(f"   Error fetching pattern '{pattern}': {str(e)}")
+            return pattern, {}, 0
+
+    # Execute patterns in parallel
+    max_workers = min(len(query_patterns), len(available_tokens))
+    total_found = 0
+
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        # Submit all patterns
+        future_to_pattern = {
+            executor.submit(fetch_pattern, pattern): pattern
+            for pattern in query_patterns
+        }
+
+        # Collect results as they complete
+        for future in as_completed(future_to_pattern):
+            pattern = future_to_pattern[future]
+            try:
+                _, pattern_prs, count = future.result()
+
+                # Merge results into global dict (thread-safe)
+                with lock:
+                    for url, pr in pattern_prs.items():
+                        if url not in prs_by_url:
+                            prs_by_url[url] = pr
+
+                total_found += count
+                print(f"   ✓ Pattern '{pattern}' completed: {count} PRs found")
+
+            except Exception as e:
+                print(f"   ✗ Pattern '{pattern}' failed: {str(e)}")
+
+    return total_found
+
+
 def extract_review_metadata(pr):
     """
     Extract minimal PR review metadata for efficient storage.
@@ -454,8 +712,9 @@ def update_pr_status(metadata_list, token_pool):
                 owner, repo, pull_word, pr_number = parts[0], parts[1], parts[2], parts[3]
                 api_url = f'https://api.github.com/repos/{owner}/{repo}/pulls/{pr_number}'
 
-                headers = token_pool.get_headers()
-                response = request_with_backoff('GET', api_url, headers=headers, max_retries=3)
+                token = token_pool.get_next_token()
+                headers = {'Authorization': f'token {token}'} if token else {}
+                response = request_with_backoff('GET', api_url, headers=headers, max_retries=3, token_pool=token_pool, token=token)
 
                 if response and response.status_code == 200:
                     pr_data = response.json()
@@ -529,29 +788,34 @@ def fetch_all_reviews_metadata(identifier, agent_name, token_pool):
     end_date = current_time.replace(hour=0, minute=0, second=0, microsecond=0)  # 12:00 AM UTC today
     start_date = end_date - timedelta(days=LEADERBOARD_TIME_FRAME_DAYS)
 
-    for query_pattern in query_patterns:
-        print(f"\n🔍 Searching with query: {query_pattern}")
-        print(f"   Time range: {start_date.strftime('%Y-%m-%d')} to {end_date.strftime('%Y-%m-%d')} (today excluded)")
+    print(f"\n🔍 Searching for PRs reviewed by {identifier}")
+    print(f"   Time range: {start_date.strftime('%Y-%m-%d')} to {end_date.strftime('%Y-%m-%d')} (today excluded)")
+    print(f"   Query patterns: {len(query_patterns)}")
 
-        pattern_start_time = time.time()
-        initial_count = len(prs_by_url)
+    overall_start_time = time.time()
 
-        # Fetch with time partitioning
+    # Use parallel execution if multiple patterns and sufficient tokens
+    if len(query_patterns) > 1:
+        reviews_found = fetch_reviews_parallel(
+            query_patterns,
+            start_date,
+            end_date,
+            token_pool,
+            prs_by_url
+        )
+    else:
+        # Single pattern, use sequential
         reviews_found = fetch_reviews_with_time_partition(
-            query_pattern,
+            query_patterns[0],
             start_date,
             end_date,
             token_pool,
             prs_by_url
         )
 
-        pattern_duration = time.time() - pattern_start_time
-        new_reviews = len(prs_by_url) - initial_count
-
-        print(f"   ✓ Pattern complete: {new_reviews} new PRs found ({reviews_found} total fetched)")
-        print(f"   ⏱️ Time taken: {pattern_duration:.1f} seconds")
-
-        time.sleep(1.0)
+    overall_duration = time.time() - overall_start_time
+    print(f"   ✓ All patterns complete: {len(prs_by_url)} unique PRs found")
+    print(f"   ⏱️ Total time: {overall_duration:.1f} seconds")
 
     all_prs = list(prs_by_url.values())
 
