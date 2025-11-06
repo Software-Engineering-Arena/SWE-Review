@@ -3,6 +3,7 @@ from gradio_leaderboard import Leaderboard
 import json
 import os
 import time
+import tempfile
 import requests
 from datetime import datetime, timezone, timedelta
 from collections import defaultdict
@@ -17,6 +18,7 @@ import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 from apscheduler.schedulers.background import BackgroundScheduler
 from apscheduler.triggers.cron import CronTrigger
+from google.cloud import bigquery
 
 # Load environment variables
 load_dotenv()
@@ -119,6 +121,284 @@ def normalize_date_format(date_string):
     except Exception as e:
         print(f"Warning: Could not parse date '{date_string}': {e}")
         return date_string
+
+
+# =============================================================================
+# BIGQUERY FUNCTIONS
+# =============================================================================
+
+def get_bigquery_client():
+    """
+    Initialize BigQuery client using credentials from environment variable.
+
+    Expects GOOGLE_APPLICATION_CREDENTIALS_JSON environment variable containing
+    the service account JSON credentials as a string.
+    """
+    # Get the JSON content from environment variable
+    creds_json = os.environ.get('GOOGLE_APPLICATION_CREDENTIALS_JSON')
+
+    if creds_json:
+        # Create a temporary file to store credentials
+        with tempfile.NamedTemporaryFile(mode='w', delete=False, suffix='.json') as temp_file:
+            temp_file.write(creds_json)
+            temp_path = temp_file.name
+
+        # Set environment variable to point to temp file
+        os.environ['GOOGLE_APPLICATION_CREDENTIALS'] = temp_path
+
+        # Initialize BigQuery client
+        client = bigquery.Client()
+
+        # Clean up temp file
+        os.unlink(temp_path)
+
+        return client
+    else:
+        raise ValueError("GOOGLE_APPLICATION_CREDENTIALS_JSON not found in environment")
+
+
+def fetch_reviews_from_bigquery(client, identifier, start_date, end_date):
+    """
+    Fetch PR review events from GitHub Archive for a specific agent.
+
+    Queries githubarchive.day.YYYYMMDD tables for PullRequestReviewEvent where
+    actor.login matches the agent identifier.
+
+    Args:
+        client: BigQuery client instance
+        identifier: GitHub username or bot identifier (e.g., 'amazon-inspector-beta[bot]')
+        start_date: Start datetime (timezone-aware)
+        end_date: End datetime (timezone-aware)
+
+    Returns:
+        List of review event rows with PR information
+    """
+    print(f"\n🔍 Querying BigQuery for reviews by {identifier}")
+    print(f"   Time range: {start_date.strftime('%Y-%m-%d')} to {end_date.strftime('%Y-%m-%d')}")
+
+    # Generate list of table names for each day in the range
+    table_refs = []
+    current_date = start_date
+    while current_date < end_date:
+        table_name = f"githubarchive.day.{current_date.strftime('%Y%m%d')}"
+        table_refs.append(table_name)
+        current_date += timedelta(days=1)
+
+    # Build UNION ALL query for all daily tables
+    union_parts = []
+    for table_name in table_refs:
+        union_parts.append(f"""
+        SELECT
+            repo.name as repo_name,
+            actor.login as actor_login,
+            JSON_EXTRACT_SCALAR(payload, '$.pull_request.html_url') as pr_url,
+            CAST(JSON_EXTRACT_SCALAR(payload, '$.pull_request.number') AS INT64) as pr_number,
+            JSON_EXTRACT_SCALAR(payload, '$.review.submitted_at') as reviewed_at,
+            created_at
+        FROM `{table_name}`
+        WHERE type = 'PullRequestReviewEvent'
+        AND actor.login = @identifier
+        """)
+
+    query = " UNION ALL ".join(union_parts)
+
+    job_config = bigquery.QueryJobConfig(
+        query_parameters=[
+            bigquery.ScalarQueryParameter("identifier", "STRING", identifier)
+        ]
+    )
+
+    print(f"   Querying {len(table_refs)} daily tables...")
+
+    try:
+        query_job = client.query(query, job_config=job_config)
+        results = list(query_job.result())
+
+        print(f"   ✓ Found {len(results)} review events")
+        return results
+
+    except Exception as e:
+        print(f"   ✗ BigQuery error: {str(e)}")
+        return []
+
+
+def fetch_pr_status_from_bigquery(client, pr_urls, start_date, end_date):
+    """
+    Fetch PR status (merged/closed) from GitHub Archive PullRequestEvent.
+
+    For each PR URL, looks for PullRequestEvent with action='closed' to determine
+    if the PR was merged or just closed.
+
+    Args:
+        client: BigQuery client instance
+        pr_urls: List of PR URLs to check status for
+        start_date: Start datetime (should cover review period and after)
+        end_date: End datetime (should be recent/current)
+
+    Returns:
+        Dictionary mapping PR URL to status dict:
+        {
+            'pr_url': {
+                'status': 'merged'|'closed'|'open',
+                'merged': bool,
+                'closed_at': timestamp or None
+            }
+        }
+    """
+    if not pr_urls:
+        return {}
+
+    print(f"\n🔍 Querying BigQuery for PR status ({len(pr_urls)} PRs)...")
+
+    # Extract repo and PR number from URLs
+    # URL format: https://github.com/owner/repo/pull/123
+    pr_info = []
+    for url in pr_urls:
+        try:
+            parts = url.replace('https://github.com/', '').split('/')
+            if len(parts) >= 4:
+                owner = parts[0]
+                repo = parts[1]
+                pr_number = int(parts[3])
+                repo_name = f"{owner}/{repo}"
+                pr_info.append({
+                    'url': url,
+                    'repo': repo_name,
+                    'number': pr_number
+                })
+        except Exception as e:
+            print(f"   Warning: Could not parse PR URL {url}: {e}")
+            continue
+
+    if not pr_info:
+        return {}
+
+    # Build repo filter condition for WHERE clause
+    # Group PRs by repo to create efficient filters
+    repos_to_prs = defaultdict(list)
+    for pr in pr_info:
+        repos_to_prs[pr['repo']].append(pr['number'])
+
+    # Generate list of table names for date range
+    # Look back 1 full year from end_date to catch PR close events that may have occurred before reviews
+    pr_status_start = end_date - timedelta(days=365)
+    table_refs = []
+    current_date = pr_status_start
+    while current_date < end_date:
+        table_name = f"githubarchive.day.{current_date.strftime('%Y%m%d')}"
+        table_refs.append(table_name)
+        current_date += timedelta(days=1)
+
+    # Build WHERE clause to filter by specific repos and PR numbers
+    # Format: (repo='owner/repo1' AND pr_number IN (1,2,3)) OR (repo='owner/repo2' AND pr_number IN (4,5))
+    filter_conditions = []
+    for repo, pr_numbers in repos_to_prs.items():
+        pr_list = ','.join(map(str, pr_numbers))
+        filter_conditions.append(f"(repo.name = '{repo}' AND CAST(JSON_EXTRACT_SCALAR(payload, '$.pull_request.number') AS INT64) IN ({pr_list}))")
+
+    pr_filter = " OR ".join(filter_conditions)
+
+    # Build query to find close/merge events for specific PRs
+    union_parts = []
+    for table_name in table_refs:
+        union_parts.append(f"""
+        SELECT
+            repo.name as repo_name,
+            CAST(JSON_EXTRACT_SCALAR(payload, '$.pull_request.number') AS INT64) as pr_number,
+            JSON_EXTRACT_SCALAR(payload, '$.pull_request.html_url') as pr_url,
+            JSON_EXTRACT_SCALAR(payload, '$.action') as action,
+            CAST(JSON_EXTRACT_SCALAR(payload, '$.pull_request.merged') AS BOOL) as merged,
+            JSON_EXTRACT_SCALAR(payload, '$.pull_request.closed_at') as closed_at,
+            JSON_EXTRACT_SCALAR(payload, '$.pull_request.merged_at') as merged_at,
+            created_at
+        FROM `{table_name}`
+        WHERE type = 'PullRequestEvent'
+        AND JSON_EXTRACT_SCALAR(payload, '$.action') = 'closed'
+        AND ({pr_filter})
+        """)
+
+    query = " UNION ALL ".join(union_parts)
+
+    print(f"   Querying {len(table_refs)} daily tables for PR status (1-year lookback: {pr_status_start.strftime('%Y-%m-%d')} to {end_date.strftime('%Y-%m-%d')})...")
+    print(f"   Filtering for {len(pr_info)} specific PRs across {len(repos_to_prs)} repos")
+
+    try:
+        query_job = client.query(query)
+        results = list(query_job.result())
+
+        print(f"   ✓ Found {len(results)} PR close events")
+
+        # Build status map by PR URL
+        status_map = {}
+        for row in results:
+            pr_url = row.pr_url
+
+            merged = row.merged if row.merged is not None else False
+            closed_at = row.closed_at or row.merged_at
+
+            # Convert to ISO format if datetime
+            if hasattr(closed_at, 'isoformat'):
+                closed_at = closed_at.isoformat()
+
+            status = 'merged' if merged else 'closed'
+
+            status_map[pr_url] = {
+                'status': status,
+                'merged': merged,
+                'closed_at': closed_at
+            }
+
+        # Mark remaining PRs as open
+        for url in pr_urls:
+            if url not in status_map:
+                status_map[url] = {
+                    'status': 'open',
+                    'merged': False,
+                    'closed_at': None
+                }
+
+        merged_count = sum(1 for s in status_map.values() if s['merged'])
+        closed_count = sum(1 for s in status_map.values() if s['status'] == 'closed')
+        open_count = sum(1 for s in status_map.values() if s['status'] == 'open')
+
+        print(f"   Status breakdown: {merged_count} merged, {closed_count} closed, {open_count} open")
+
+        return status_map
+
+    except Exception as e:
+        print(f"   ✗ BigQuery error: {str(e)}")
+        # Return all as open on error
+        return {url: {'status': 'open', 'merged': False, 'closed_at': None} for url in pr_urls}
+
+
+def extract_review_metadata_from_bigquery(review_row, status_info):
+    """
+    Extract minimal PR review metadata from BigQuery row and status info.
+
+    Args:
+        review_row: BigQuery row from PullRequestReviewEvent query
+        status_info: Status dictionary from fetch_pr_status_from_bigquery
+
+    Returns:
+        Dictionary with review metadata
+    """
+    pr_url = review_row.pr_url
+    pr_number = review_row.pr_number
+    reviewed_at = review_row.reviewed_at or review_row.created_at
+
+    # Convert to ISO format if datetime
+    if hasattr(reviewed_at, 'isoformat'):
+        reviewed_at = reviewed_at.isoformat()
+
+    return {
+        'html_url': pr_url,
+        'reviewed_at': reviewed_at,
+        'pr_status': status_info['status'],
+        'pr_merged': status_info['merged'],
+        'pr_closed_at': status_info['closed_at'],
+        'pr_url': pr_url,
+        'review_id': f"pr_{pr_number}"
+    }
 
 
 # =============================================================================
@@ -1788,19 +2068,24 @@ def create_monthly_metrics_plot():
     # Create figure with secondary y-axis
     fig = make_subplots(specs=[[{"secondary_y": True}]])
 
-    # Define colors for agents (using a color palette)
-    colors = [
-        '#1f77b4', '#ff7f0e', '#2ca02c', '#d62728', '#9467bd',
-        '#8c564b', '#e377c2', '#7f7f7f', '#bcbd22', '#17becf'
-    ]
+    # Generate unique colors for many agents using HSL color space
+    def generate_color(index, total):
+        """Generate distinct colors using HSL color space for better distribution"""
+        hue = (index * 360 / total) % 360
+        saturation = 70 + (index % 3) * 10  # Vary saturation slightly
+        lightness = 45 + (index % 2) * 10   # Vary lightness slightly
+        return f'hsl({hue}, {saturation}%, {lightness}%)'
 
     agents = metrics['agents']
     months = metrics['months']
     data = metrics['data']
 
+    # Generate colors for all agents
+    agent_colors = {agent: generate_color(idx, len(agents)) for idx, agent in enumerate(agents)}
+
     # Add traces for each agent
     for idx, agent_name in enumerate(agents):
-        color = colors[idx % len(colors)]
+        color = agent_colors[agent_name]
         agent_data = data[agent_name]
 
         # Add line trace for acceptance rate (left y-axis)
@@ -1817,10 +2102,11 @@ def create_monthly_metrics_plot():
                     name=agent_name,
                     mode='lines+markers',
                     line=dict(color=color, width=2),
-                    marker=dict(size=6),
+                    marker=dict(size=8),
                     legendgroup=agent_name,
-                    showlegend=True,
-                    hovertemplate='<b>%{fullData.name}</b><br>' +
+                    showlegend=False,  # Hide legend for 70+ agents
+                    hovertemplate='<b>Agent: %{fullData.name}</b><br>' +
+                                 'Month: %{x}<br>' +
                                  'Acceptance Rate: %{y:.2f}%<br>' +
                                  '<extra></extra>'
                 ),
@@ -1841,11 +2127,12 @@ def create_monthly_metrics_plot():
                 go.Bar(
                     x=x_bars,
                     y=y_bars,
-                    name=f"{agent_name} (Reviews)",
+                    name=agent_name,
                     marker=dict(color=color, opacity=0.6),
                     legendgroup=agent_name,
-                    showlegend=False,  # Don't show in legend (already shown for line)
-                    hovertemplate='<b>%{fullData.name}</b><br>' +
+                    showlegend=False,  # Hide legend for 70+ agents
+                    hovertemplate='<b>Agent: %{fullData.name}</b><br>' +
+                                 'Month: %{x}<br>' +
                                  'Total Reviews: %{y}<br>' +
                                  '<extra></extra>',
                     offsetgroup=agent_name  # Group bars by agent for proper spacing
@@ -1861,17 +2148,11 @@ def create_monthly_metrics_plot():
     # Update layout
     fig.update_layout(
         title=None,
-        hovermode='closest',
+        hovermode='closest',  # Show individual agent info on hover
         barmode='group',
         height=600,
-        legend=dict(
-            orientation="h",
-            yanchor="bottom",
-            y=1.02,
-            xanchor="right",
-            x=1
-        ),
-        margin=dict(l=50, r=50, t=100, b=50)
+        showlegend=False,  # Hide legend for 70+ agents
+        margin=dict(l=50, r=50, t=50, b=50)  # Reduced top margin since no legend
     )
 
     return fig
@@ -1978,17 +2259,21 @@ def submit_agent(identifier, agent_name, organization, description, website):
 
 def fetch_and_update_daily_reviews():
     """
-    Fetch and update reviews with comprehensive status checking.
+    Fetch and update reviews with comprehensive status checking using BigQuery.
 
     Strategy:
     1. For each agent:
        - Examine ALL open reviews from last LEADERBOARD_TIME_FRAME_DAYS - 1 for their closed_at status
-       - Update PR status for all existing metadata (last LEADERBOARD_TIME_FRAME_DAYS - 1)
-       - Fetch new reviews from yesterday 12am to today 12am
+       - Update PR status for all existing metadata using BigQuery (last LEADERBOARD_TIME_FRAME_DAYS - 1)
+       - Fetch new reviews from yesterday 12am to today 12am using BigQuery
        - Save all updated/new metadata back to HuggingFace
     """
-    tokens = get_github_tokens()
-    token_pool = TokenPool(tokens)
+    # Initialize BigQuery client
+    try:
+        client = get_bigquery_client()
+    except Exception as e:
+        print(f"✗ Failed to initialize BigQuery client: {str(e)}")
+        return
 
     # Load all agents
     agents = load_agents_from_hf()
@@ -2041,44 +2326,62 @@ def fetch_and_update_daily_reviews():
 
             print(f"   ✓ Loaded {len(recent_metadata)} existing reviews from timeframe")
 
-            # Step 2: Examine ALL open reviews for their closed_at status
-            # This ensures we capture any reviews that may have been closed/merged since last check
+            # Step 2: Update PR status for existing reviews using BigQuery
             if recent_metadata:
-                print(f"🔍 Examining {len(recent_metadata)} open reviews for status updates (checking closed_at)...")
-                recent_metadata = update_pr_status(recent_metadata, token_pool)
-                print(f"   ✓ Updated PR status for existing reviews")
+                print(f"🔍 Updating PR status for {len(recent_metadata)} existing reviews using BigQuery...")
+                # Extract PR URLs from existing metadata
+                pr_urls = [r.get('pr_url') for r in recent_metadata if r.get('pr_url')]
+                if pr_urls:
+                    # Fetch status from BigQuery
+                    extended_end_date = today_utc
+                    status_map = fetch_pr_status_from_bigquery(client, pr_urls, cutoff_date, extended_end_date)
 
-            # Step 3: Fetch NEW reviews from yesterday 12am to today 12am
-            print(f"🔍 Fetching new reviews from {yesterday_midnight.isoformat()} to {today_midnight.isoformat()}...")
+                    # Update metadata with new status
+                    for review in recent_metadata:
+                        pr_url = review.get('pr_url')
+                        if pr_url and pr_url in status_map:
+                            status_info = status_map[pr_url]
+                            review['pr_status'] = status_info['status']
+                            review['pr_merged'] = status_info['merged']
+                            review['pr_closed_at'] = status_info['closed_at']
 
-            base_query = f'is:pr review:approved author:{identifier} -is:draft'
-            prs_by_url = {}
+                    print(f"   ✓ Updated PR status for existing reviews")
 
-            fetch_reviews_with_time_partition(
-                base_query,
-                yesterday_midnight,
-                today_midnight,
-                token_pool,
-                prs_by_url,
-                debug_limit=None
-            )
+            # Step 3: Fetch NEW reviews from yesterday 12am to today 12am using BigQuery
+            print(f"🔍 Fetching new reviews from {yesterday_midnight.isoformat()} to {today_midnight.isoformat()} using BigQuery...")
+
+            review_rows = fetch_reviews_from_bigquery(client, identifier, yesterday_midnight, today_midnight)
+
+            # Extract unique PR URLs and fetch status
+            pr_urls = list(set([row.pr_url for row in review_rows if row.pr_url]))
+            print(f"   Found {len(review_rows)} review events across {len(pr_urls)} unique PRs")
+
+            # Fetch PR status for new reviews
+            extended_end_date = today_utc
+            status_map = fetch_pr_status_from_bigquery(client, pr_urls, yesterday_midnight, extended_end_date)
 
             # Extract metadata for new reviews
             yesterday_metadata = []
-            for pr_url, pr in prs_by_url.items():
-                metadata = extract_review_metadata(pr)
-                if metadata:
-                    metadata['agent_identifier'] = identifier
-                    yesterday_metadata.append(metadata)
+            seen_prs = set()
+            for row in review_rows:
+                pr_url = row.pr_url
+                if pr_url in seen_prs:
+                    continue
+                seen_prs.add(pr_url)
 
-            print(f"   ✓ Found {len(yesterday_metadata)} new reviews in 24-hour window")
+                status_info = status_map.get(pr_url, {
+                    'status': 'open',
+                    'merged': False,
+                    'closed_at': None
+                })
 
-            # Step 4: Update PR status for new reviews
-            if yesterday_metadata:
-                print(f"   Updating PR status for {len(yesterday_metadata)} new reviews...")
-                yesterday_metadata = update_pr_status(yesterday_metadata, token_pool)
+                metadata = extract_review_metadata_from_bigquery(row, status_info)
+                metadata['agent_identifier'] = identifier
+                yesterday_metadata.append(metadata)
 
-            # Step 5: Combine and save all metadata
+            print(f"   ✓ Found {len(yesterday_metadata)} unique PRs in 24-hour window")
+
+            # Step 4: Combine and save all metadata
             all_updated_metadata = recent_metadata + yesterday_metadata
 
             if all_updated_metadata:
