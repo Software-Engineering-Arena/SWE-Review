@@ -379,13 +379,13 @@ def save_review_metadata_to_hf(metadata_list, agent_identifier):
                 save_jsonl(local_filename, day_metadata)
                 print(f"      Prepared {len(day_metadata)} reviews for {filename}")
 
-            # Upload entire folder in a single commit
-            print(f"   📤 Uploading {len(grouped)} files in single batch commit...")
+            # Upload entire folder using upload_large_folder (optimized for large files)
+            # Note: upload_large_folder creates multiple commits automatically and doesn't support custom commit_message
+            print(f"   📤 Uploading {len(grouped)} files ({len(metadata_list)} total reviews)...")
             api.upload_large_folder(
                 folder_path=temp_dir,
                 repo_id=REVIEW_METADATA_REPO,
-                repo_type="dataset",
-                commit_message=f"Update: {agent_identifier} ({len(grouped)} daily files, {len(metadata_list)} total reviews)"
+                repo_type="dataset"
             )
             print(f"   ✓ Batch upload complete for {agent_identifier}")
 
