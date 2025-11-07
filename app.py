@@ -33,7 +33,7 @@ args = parser.parse_args()
 
 AGENTS_REPO = "SWE-Arena/swe_agents"  # HuggingFace dataset for agent metadata
 REVIEW_METADATA_REPO = "SWE-Arena/review_metadata"  # HuggingFace dataset for review metadata
-LEADERBOARD_TIME_FRAME_DAYS = 180  # Time frame for leaderboard
+LEADERBOARD_TIME_FRAME_DAYS = 30  # Time frame for leaderboard
 
 LEADERBOARD_COLUMNS = [
     ("Agent Name", "string"),
@@ -2160,7 +2160,7 @@ def create_monthly_metrics_plot(top_n=None):
 
     # Update axes labels
     fig.update_xaxes(title_text=None)
-    fig.update_yaxes(title_text="<b>Acceptance Rate (%)</b>", secondary_y=False)
+    fig.update_yaxes(title_text="<b>Acceptance Rate (%)</b>", range=[0, 100], secondary_y=False)
     fig.update_yaxes(title_text="<b>Total Reviews</b>", secondary_y=True)
 
     # Update layout
