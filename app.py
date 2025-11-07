@@ -13,7 +13,6 @@ import threading
 from dotenv import load_dotenv
 import pandas as pd
 import random
-import argparse
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 from apscheduler.schedulers.background import BackgroundScheduler
@@ -22,10 +21,6 @@ from google.cloud import bigquery
 
 # Load environment variables
 load_dotenv()
-
-# Parse command-line arguments
-parser = argparse.ArgumentParser(description='SWE Agent Review Leaderboard')
-args = parser.parse_args()
 
 # =============================================================================
 # CONFIGURATION
