@@ -2182,15 +2182,16 @@ print(f"✓ Scheduler started: Incremental Update at 12:00 AM UTC every Monday (
 
 # Create Gradio interface
 with gr.Blocks(title="SWE Agent Review Leaderboard", theme=gr.themes.Soft()) as app:
+    total_months = LEADERBOARD_TIME_FRAME_DAYS // 30
 
     gr.Markdown("# 🏆 SWE Agent Review Leaderboard")
-    gr.Markdown("Track and compare GitHub PR review acceptance statistics for SWE agents (last month)")
+    gr.Markdown(f"Track and compare GitHub PR review acceptance statistics for SWE agents (last {total_months} months)")
     
     with gr.Tabs():
 
         # Leaderboard Tab
         with gr.Tab("📊 Leaderboard"):
-            gr.Markdown("*All statistics are based on reviews from the last month*")
+            gr.Markdown(f"*All statistics are based on reviews from the last {total_months} months*")
             leaderboard_table = Leaderboard(
                 value=pd.DataFrame(columns=[col[0] for col in LEADERBOARD_COLUMNS]),  # Empty initially
                 datatype=LEADERBOARD_COLUMNS,
