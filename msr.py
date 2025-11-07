@@ -152,8 +152,8 @@ def fetch_all_pr_metadata_single_query(client, identifiers, start_date, end_date
     # Generate table UNION statements for review period
     review_tables = generate_table_union_statements(start_date, end_date)
     
-    # Generate table UNION statements for PR status (look back 1 year to catch all closures)
-    status_start_date = end_date - timedelta(days=365)
+    # Generate table UNION statements for PR status (use same lookback as reviews)
+    status_start_date = end_date - timedelta(days=LEADERBOARD_TIME_FRAME_DAYS)
     status_tables = generate_table_union_statements(status_start_date, end_date)
     
     # Build identifier list for IN clause

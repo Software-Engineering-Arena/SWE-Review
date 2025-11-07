@@ -1,5 +1,5 @@
 import gradio as gr
-from gradio_leaderboard import Leaderboard
+from gradio_leaderboard import Leaderboard, ColumnFilter
 import json
 import os
 import time
@@ -33,7 +33,7 @@ args = parser.parse_args()
 
 AGENTS_REPO = "SWE-Arena/swe_agents"  # HuggingFace dataset for agent metadata
 REVIEW_METADATA_REPO = "SWE-Arena/review_metadata"  # HuggingFace dataset for review metadata
-LEADERBOARD_TIME_FRAME_DAYS = 30  # Time frame for leaderboard
+LEADERBOARD_TIME_FRAME_DAYS = 180  # Time frame for leaderboard
 
 LEADERBOARD_COLUMNS = [
     ("Agent Name", "string"),
@@ -205,182 +205,38 @@ def fetch_reviews_from_bigquery(client, identifier, start_date, end_date):
         return []
 
 
-def fetch_pr_status_from_bigquery(client, urls, start_date, end_date):
+def extract_review_metadata_from_bigquery(review_row):
     """
-    Fetch PR status (merged/closed) from GitHub Archive PullRequestEvent.
-
-    For each PR URL, looks for PullRequestEvent with action='closed' to determine
-    if the PR was merged or just closed.
-
-    Args:
-        client: BigQuery client instance
-        urls: List of PR URLs to check status for
-        start_date: Start datetime (should cover review period and after)
-        end_date: End datetime (should be recent/current)
-
-    Returns:
-        Dictionary mapping PR URL to status dict:
-        {
-            'url': {
-                'status': 'merged'|'closed'|'open',
-                'merged': bool,
-                'closed_at': timestamp or None
-            }
-        }
-    """
-    if not urls:
-        return {}
-
-    print(f"\n🔍 Querying BigQuery for PR status ({len(urls)} PRs)...")
-
-    # Extract repo and PR number from URLs
-    # URL format: https://github.com/owner/repo/pull/123
-    pr_info = []
-    for url in urls:
-        try:
-            parts = url.replace('https://github.com/', '').split('/')
-            if len(parts) >= 4:
-                owner = parts[0]
-                repo = parts[1]
-                pr_number = int(parts[3])
-                repo_name = f"{owner}/{repo}"
-                pr_info.append({
-                    'url': url,
-                    'repo': repo_name,
-                    'number': pr_number
-                })
-        except Exception as e:
-            print(f"   Warning: Could not parse PR URL {url}: {e}")
-            continue
-
-    if not pr_info:
-        return {}
-
-    # Build repo filter condition for WHERE clause
-    # Group PRs by repo to create efficient filters
-    repos_to_prs = defaultdict(list)
-    for pr in pr_info:
-        repos_to_prs[pr['repo']].append(pr['number'])
-
-    # Generate list of table names for date range
-    # Look back 1 full year from end_date to catch PR close events that may have occurred before reviews
-    pr_status_start = end_date - timedelta(days=365)
-    table_refs = []
-    current_date = pr_status_start
-    while current_date < end_date:
-        table_name = f"githubarchive.day.{current_date.strftime('%Y%m%d')}"
-        table_refs.append(table_name)
-        current_date += timedelta(days=1)
-
-    # Build WHERE clause to filter by specific repos and PR numbers
-    # Format: (repo='owner/repo1' AND pr_number IN (1,2,3)) OR (repo='owner/repo2' AND pr_number IN (4,5))
-    filter_conditions = []
-    for repo, pr_numbers in repos_to_prs.items():
-        pr_list = ','.join(map(str, pr_numbers))
-        filter_conditions.append(f"(repo.name = '{repo}' AND CAST(JSON_EXTRACT_SCALAR(payload, '$.pull_request.number') AS INT64) IN ({pr_list}))")
-
-    pr_filter = " OR ".join(filter_conditions)
-
-    # Build query to find close/merge events for specific PRs
-    union_parts = []
-    for table_name in table_refs:
-        union_parts.append(f"""
-        SELECT
-            repo.name as repo_name,
-            CAST(JSON_EXTRACT_SCALAR(payload, '$.pull_request.number') AS INT64) as pr_number,
-            JSON_EXTRACT_SCALAR(payload, '$.pull_request.url') as url,
-            JSON_EXTRACT_SCALAR(payload, '$.action') as action,
-            CAST(JSON_EXTRACT_SCALAR(payload, '$.pull_request.merged') AS BOOL) as merged,
-            JSON_EXTRACT_SCALAR(payload, '$.pull_request.closed_at') as closed_at,
-            JSON_EXTRACT_SCALAR(payload, '$.pull_request.merged_at') as merged_at,
-            created_at
-        FROM `{table_name}`
-        WHERE type = 'PullRequestEvent'
-        AND JSON_EXTRACT_SCALAR(payload, '$.action') = 'closed'
-        AND ({pr_filter})
-        """)
-
-    query = " UNION ALL ".join(union_parts)
-
-    print(f"   Querying {len(table_refs)} daily tables for PR status (1-year lookback: {pr_status_start.strftime('%Y-%m-%d')} to {end_date.strftime('%Y-%m-%d')})...")
-    print(f"   Filtering for {len(pr_info)} specific PRs across {len(repos_to_prs)} repos")
-
-    try:
-        query_job = client.query(query)
-        results = list(query_job.result())
-
-        print(f"   ✓ Found {len(results)} PR close events")
-
-        # Build status map by PR URL
-        status_map = {}
-        for row in results:
-            url = row.url
-
-            merged = row.merged if row.merged is not None else False
-            closed_at = row.closed_at or row.merged_at
-
-            # Convert to ISO format if datetime
-            if hasattr(closed_at, 'isoformat'):
-                closed_at = closed_at.isoformat()
-
-            status = 'merged' if merged else 'closed'
-
-            status_map[url] = {
-                'status': status,
-                'merged': merged,
-                'closed_at': closed_at
-            }
-
-        # Mark remaining PRs as open
-        for url in urls:
-            if url not in status_map:
-                status_map[url] = {
-                    'status': 'open',
-                    'merged': False,
-                    'closed_at': None
-                }
-
-        merged_count = sum(1 for s in status_map.values() if s['merged'])
-        closed_count = sum(1 for s in status_map.values() if s['status'] == 'closed')
-        open_count = sum(1 for s in status_map.values() if s['status'] == 'open')
-
-        print(f"   Status breakdown: {merged_count} merged, {closed_count} closed, {open_count} open")
-
-        return status_map
-
-    except Exception as e:
-        print(f"   ✗ BigQuery error: {str(e)}")
-        # Return all as open on error
-        return {url: {'status': 'open', 'merged': False, 'closed_at': None} for url in urls}
-
-
-def extract_review_metadata_from_bigquery(review_row, status_info):
-    """
-    Extract minimal PR review metadata from BigQuery row and status info.
+    Extract minimal PR review metadata from BigQuery row.
 
     Args:
         review_row: BigQuery row from PullRequestReviewEvent query
-        status_info: Status dictionary from fetch_pr_status_from_bigquery
 
     Returns:
-        Dictionary with review metadata
+        Dictionary with review metadata containing:
+        - url: PR URL
+        - reviewed_at: Review timestamp
+        - merged_at: Merge timestamp (if merged, else None)
+        - closed_at: Close timestamp (if closed, else None)
     """
     url = review_row.url
-    pr_number = review_row.pr_number
     reviewed_at = review_row.reviewed_at or review_row.created_at
+    merged_at = getattr(review_row, 'merged_at', None)
+    closed_at = getattr(review_row, 'closed_at', None)
 
     # Convert to ISO format if datetime
     if hasattr(reviewed_at, 'isoformat'):
         reviewed_at = reviewed_at.isoformat()
+    if merged_at and hasattr(merged_at, 'isoformat'):
+        merged_at = merged_at.isoformat()
+    if closed_at and hasattr(closed_at, 'isoformat'):
+        closed_at = closed_at.isoformat()
 
     return {
         'url': url,
         'reviewed_at': reviewed_at,
-        'pr_status': status_info['status'],
-        'merged_at': status_info['merged'],
-        'closed_at': status_info['closed_at'],
-        'url': url,
-        'review_id': f"pr_{pr_number}"
+        'merged_at': merged_at,
+        'closed_at': closed_at
     }
 
 
@@ -994,137 +850,33 @@ def fetch_reviews_parallel(query_patterns, start_date, end_date, token_pool, prs
 def extract_review_metadata(pr):
     """
     Extract minimal PR review metadata for efficient storage.
-    Only keeps essential fields: url, reviewed_at, pr_status, merged_at, closed_at.
+    Only keeps essential fields: url, reviewed_at, merged_at, closed_at.
     Note: agent_name is not stored as it's inferred from the folder structure.
 
-    PR status:
-    - pr_status: 'open', 'merged', or 'closed'
-    - merged_at: True if PR was merged, False otherwise
-    - closed_at: Date when PR was closed/merged (if applicable)
+    Status can be derived from the timestamps:
+    - merged_at: Timestamp if PR was merged, None otherwise
+    - closed_at: Timestamp if PR was closed (either merged or just closed), None otherwise
 
-    Merged PR = PR that was merged after agent review
-    Rejected PR = PR that was closed without merging after agent review
+    Merged PR = PR that was merged (merged_at is not None)
+    Rejected PR = PR that was closed without merging (closed_at is not None but merged_at is None)
+    Open PR = PR still open (both merged_at and closed_at are None)
     """
     # Extract PR metadata from search results
     # The GitHub search API returns PR data from /search/issues endpoint
     url = pr.get('url')
-    pr_number = pr.get('number')
     created_at = pr.get('created_at')
     closed_at = pr.get('closed_at')
-    state = pr.get('state', 'open')  # open or closed
 
     # Check if PR has pull_request field (indicates it's a PR, not an issue)
     pull_request_data = pr.get('pull_request', {})
-
-    # For initial extraction, we don't know if merged yet
-    # This will be updated by update_pr_status function
-    merged_at = pull_request_data.get('merged_at') is not None if pull_request_data else False
-
-    # Determine initial status
-    if merged_at:
-        status = 'merged'
-    elif state == 'closed':
-        status = 'closed'
-    else:
-        status = 'open'
+    merged_at = pull_request_data.get('merged_at') if pull_request_data else None
 
     return {
         'url': url,
         'reviewed_at': created_at,  # When the PR was created (agent reviewed it)
-        'pr_status': status,
         'merged_at': merged_at,
-        'closed_at': closed_at,
-        'review_id': f"pr_{pr_number}"  # Use PR number for deduplication
+        'closed_at': closed_at
     }
-
-
-def update_pr_status(metadata_list, token_pool):
-    """
-    Update PR status for reviews to get current merged/closed state.
-
-    For each PR associated with a review, fetch current status from GitHub API.
-    Updates metadata_list in-place with PR status information.
-
-    Args:
-        metadata_list: List of review metadata dictionaries
-        token_pool: TokenPool instance for rotating tokens
-
-    Returns:
-        Updated metadata_list with current PR status
-    """
-    if not metadata_list:
-        return metadata_list
-
-    # Track unique PRs to avoid duplicate API calls
-    url_to_status = {}
-    updated_count = 0
-
-    for metadata in metadata_list:
-        url = metadata.get('url')
-        if not url:
-            continue
-
-        # Skip if already fetched for this PR
-        if url in url_to_status:
-            status_info = url_to_status[url]
-            metadata['pr_status'] = status_info['status']
-            metadata['merged_at'] = status_info['merged']
-            metadata['closed_at'] = status_info['closed_at']
-            continue
-
-        try:
-            # Convert HTML URL to API URL
-            # https://github.com/owner/repo/pull/123 -> https://api.github.com/repos/owner/repo/pulls/123
-            parts = url.replace('https://github.com/', '').split('/')
-            if len(parts) >= 4:
-                owner, repo, pull_word, pr_number = parts[0], parts[1], parts[2], parts[3]
-                api_url = f'https://api.github.com/repos/{owner}/{repo}/pulls/{pr_number}'
-
-                token = token_pool.get_next_token()
-                headers = {'Authorization': f'token {token}'} if token else {}
-                response = request_with_backoff('GET', api_url, headers=headers, max_retries=3, token_pool=token_pool, token=token)
-
-                if response and response.status_code == 200:
-                    pr_data = response.json()
-                    state = pr_data.get('state', 'open')
-                    merged = pr_data.get('merged', False)
-                    closed_at = pr_data.get('closed_at')
-                    merged_at = pr_data.get('merged_at')
-
-                    # Determine final status
-                    if merged:
-                        status = 'merged'
-                    elif state == 'closed':
-                        status = 'closed'
-                    else:
-                        status = 'open'
-
-                    status_info = {
-                        'status': status,
-                        'merged': merged,
-                        'closed_at': closed_at or merged_at
-                    }
-
-                    # Cache and update
-                    url_to_status[url] = status_info
-                    metadata['pr_status'] = status
-                    metadata['merged_at'] = merged
-                    metadata['closed_at'] = closed_at or merged_at
-                    updated_count += 1
-
-                # Small delay to avoid rate limiting
-                time.sleep(0.1)
-
-        except Exception as e:
-            print(f"   Warning: Could not check PR status for {url}: {e}")
-            continue
-
-    if updated_count > 0:
-        print(f"   ✓ Updated status for {updated_count} unique PRs")
-
-    return metadata_list
-
-
 
 
 def get_pr_status_from_metadata(review_meta):
@@ -1262,13 +1014,13 @@ def calculate_monthly_metrics_by_agent(top_n=None):
         for month in months:
             reviews_in_month = month_dict.get(month, [])
 
-            # Count merged PRs (merged)
+            # Count merged PRs (merged_at is set)
             merged_count = sum(1 for review in reviews_in_month
-                                if review.get('pr_status') == 'merged')
+                                if get_pr_status_from_metadata(review) == 'merged')
 
             # Count rejected PRs (closed without merging)
             rejected_count = sum(1 for review in reviews_in_month
-                                if review.get('pr_status') == 'closed')
+                                if get_pr_status_from_metadata(review) == 'closed')
 
             # Total reviews created in this month
             total_count = len(reviews_in_month)
@@ -1342,7 +1094,7 @@ def save_review_metadata_to_hf(metadata_list, agent_identifier):
     Save review metadata to HuggingFace dataset, organized by [agent_identifier]/YYYY.MM.DD.jsonl.
     Each file is stored in the agent's folder and named YYYY.MM.DD.jsonl for that day's reviews.
 
-    This function APPENDS new metadata and DEDUPLICATES by review_id.
+    This function APPENDS new metadata and DEDUPLICATES by URL.
     Uses batch upload to avoid rate limit (uploads entire folder in single commit).
 
     Args:
@@ -1389,13 +1141,13 @@ def save_review_metadata_to_hf(metadata_list, agent_identifier):
                 except Exception:
                     print(f"   Creating new file: {filename}")
 
-                # Merge and deduplicate by review_id
-                existing_by_id = {meta['review_id']: meta for meta in existing_metadata if meta.get('review_id')}
-                new_by_id = {meta['review_id']: meta for meta in day_metadata if meta.get('review_id')}
+                # Merge and deduplicate by URL
+                existing_by_url = {meta['url']: meta for meta in existing_metadata if meta.get('url')}
+                new_by_url = {meta['url']: meta for meta in day_metadata if meta.get('url')}
 
                 # Update with new data (new data overwrites old)
-                existing_by_id.update(new_by_id)
-                merged_metadata = list(existing_by_id.values())
+                existing_by_url.update(new_by_url)
+                merged_metadata = list(existing_by_url.values())
 
                 # Save to temp directory
                 save_jsonl(local_filename, merged_metadata)
@@ -2160,7 +1912,15 @@ def create_monthly_metrics_plot(top_n=None):
 
     # Update axes labels
     fig.update_xaxes(title_text=None)
-    fig.update_yaxes(title_text="<b>Acceptance Rate (%)</b>", range=[0, 100], secondary_y=False)
+    fig.update_yaxes(
+        title_text="<b>Acceptance Rate (%)</b>",
+        range=[0, 100],
+        secondary_y=False,
+        showticklabels=True,
+        tickmode='linear',
+        dtick=10,
+        showgrid=True
+    )
     fig.update_yaxes(title_text="<b>Total Reviews</b>", secondary_y=True)
 
     # Update layout
@@ -2240,7 +2000,7 @@ def get_leaderboard_dataframe():
     return df
 
 
-def submit_agent(identifier, agent_name, organization, description, website):
+def submit_agent(identifier, agent_name, developer, description, website):
     """
     Submit a new agent to the leaderboard.
     Validates input, saves submission, and fetches PR metadata (memory-efficient).
@@ -2250,15 +2010,15 @@ def submit_agent(identifier, agent_name, organization, description, website):
         return "❌ GitHub identifier is required", get_leaderboard_dataframe()
     if not agent_name or not agent_name.strip():
         return "❌ Agent name is required", get_leaderboard_dataframe()
-    if not organization or not organization.strip():
-        return "❌ Organization name is required", get_leaderboard_dataframe()
+    if not developer or not developer.strip():
+        return "❌ Developer name is required", get_leaderboard_dataframe()
     if not website or not website.strip():
         return "❌ Website URL is required", get_leaderboard_dataframe()
 
     # Clean inputs
     identifier = identifier.strip()
     agent_name = agent_name.strip()
-    organization = organization.strip()
+    developer = developer.strip()
     description = description.strip()
     website = website.strip()
 
@@ -2277,7 +2037,7 @@ def submit_agent(identifier, agent_name, organization, description, website):
     # Create submission
     submission = {
         'agent_name': agent_name,
-        'organization': organization,
+        'developer': developer,
         'github_identifier': identifier,
         'description': description,
         'website': website,
@@ -2364,39 +2124,14 @@ def fetch_and_update_weekly_reviews():
 
             print(f"   ✓ Loaded {len(recent_metadata)} existing reviews from timeframe")
 
-            # Step 2: Update PR status for existing reviews using BigQuery
-            if recent_metadata:
-                print(f"🔍 Updating PR status for {len(recent_metadata)} existing reviews using BigQuery...")
-                # Extract PR URLs from existing metadata
-                urls = [r.get('url') for r in recent_metadata if r.get('url')]
-                if urls:
-                    # Fetch status from BigQuery
-                    extended_end_date = today_utc
-                    status_map = fetch_pr_status_from_bigquery(client, urls, cutoff_date, extended_end_date)
-
-                    # Update metadata with new status
-                    for review in recent_metadata:
-                        url = review.get('url')
-                        if url and url in status_map:
-                            status_info = status_map[url]
-                            review['pr_status'] = status_info['status']
-                            review['merged_at'] = status_info['merged']
-                            review['closed_at'] = status_info['closed_at']
-
-                    print(f"   ✓ Updated PR status for existing reviews")
-
-            # Step 3: Fetch NEW reviews from last week to today using BigQuery
+            # Step 2: Fetch NEW reviews from last week to today using BigQuery
             print(f"🔍 Fetching new reviews from {last_week_midnight.isoformat()} to {today_midnight.isoformat()} using BigQuery...")
 
             review_rows = fetch_reviews_from_bigquery(client, identifier, last_week_midnight, today_midnight)
 
-            # Extract unique PR URLs and fetch status
+            # Extract unique PRs
             urls = list(set([row.url for row in review_rows if row.url]))
             print(f"   Found {len(review_rows)} review events across {len(urls)} unique PRs")
-
-            # Fetch PR status for new reviews
-            extended_end_date = today_utc
-            status_map = fetch_pr_status_from_bigquery(client, urls, last_week_midnight, extended_end_date)
 
             # Extract metadata for new reviews
             weekly_metadata = []
@@ -2407,25 +2142,19 @@ def fetch_and_update_weekly_reviews():
                     continue
                 seen_prs.add(url)
 
-                status_info = status_map.get(url, {
-                    'status': 'open',
-                    'merged': False,
-                    'closed_at': None
-                })
-
-                metadata = extract_review_metadata_from_bigquery(row, status_info)
+                metadata = extract_review_metadata_from_bigquery(row)
                 metadata['agent_identifier'] = identifier
                 weekly_metadata.append(metadata)
 
             print(f"   ✓ Found {len(weekly_metadata)} unique PRs in 7-day window")
 
-            # Step 4: Combine and save all metadata
+            # Step 3: Combine and save all metadata
             all_updated_metadata = recent_metadata + weekly_metadata
 
             if all_updated_metadata:
                 print(f"💾 Saving {len(all_updated_metadata)} total reviews to HuggingFace...")
                 save_review_metadata_to_hf(all_updated_metadata, identifier)
-                print(f"✓ Updated {identifier}: {len(recent_metadata)} existing (status checked) + {len(weekly_metadata)} new = {len(all_updated_metadata)} total")
+                print(f"✓ Updated {identifier}: {len(recent_metadata)} existing + {len(weekly_metadata)} new = {len(all_updated_metadata)} total")
             else:
                 print(f"   No reviews to save for {identifier}")
 
@@ -2467,7 +2196,16 @@ with gr.Blocks(title="SWE Agent Review Leaderboard", theme=gr.themes.Soft()) as 
                 value=pd.DataFrame(columns=[col[0] for col in LEADERBOARD_COLUMNS]),  # Empty initially
                 datatype=LEADERBOARD_COLUMNS,
                 search_columns=["Agent Name", "Website"],
-                filter_columns=["Acceptance Rate (%)"]
+                filter_columns=[
+                    ColumnFilter(
+                        "Acceptance Rate (%)",
+                        min=0,
+                        max=100,
+                        default=[0, 100],
+                        type="slider",
+                        label="Acceptance Rate (%)"
+                    )
+                ]
             )
 
             # Load leaderboard data when app starts
@@ -2510,9 +2248,9 @@ with gr.Blocks(title="SWE Agent Review Leaderboard", theme=gr.themes.Soft()) as 
                     )
                 
                 with gr.Column():
-                    organization_input = gr.Textbox(
-                        label="Organization*",
-                        placeholder="Your organization or team name"
+                    developer_input = gr.Textbox(
+                        label="Developer*",
+                        placeholder="Your developer or team name"
                     )
                     description_input = gr.Textbox(
                         label="Description",
@@ -2536,7 +2274,7 @@ with gr.Blocks(title="SWE Agent Review Leaderboard", theme=gr.themes.Soft()) as 
             # Event handler
             submit_button.click(
                 fn=submit_agent,
-                inputs=[github_input, name_input, organization_input, description_input, website_input],
+                inputs=[github_input, name_input, developer_input, description_input, website_input],
                 outputs=[submission_status, leaderboard_table]
             )
 
