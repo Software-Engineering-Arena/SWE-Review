@@ -182,6 +182,7 @@ def fetch_reviews_from_bigquery(client, identifier, start_date, end_date):
         FROM `{table_name}`
         WHERE type = 'PullRequestReviewEvent'
         AND actor.login = @identifier
+        AND JSON_EXTRACT_SCALAR(payload, '$.pull_request.url') IS NOT NULL
         """)
 
     query = " UNION ALL ".join(union_parts)

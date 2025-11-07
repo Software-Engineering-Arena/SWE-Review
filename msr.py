@@ -178,6 +178,7 @@ def fetch_all_pr_metadata_single_query(client, identifiers, start_date, end_date
       WHERE
         type = 'PullRequestReviewEvent'
         AND actor.login IN ({identifier_list})
+        AND JSON_EXTRACT_SCALAR(payload, '$.pull_request.html_url') IS NOT NULL
 
       UNION ALL
 
@@ -195,6 +196,7 @@ def fetch_all_pr_metadata_single_query(client, identifiers, start_date, end_date
         type = 'IssueCommentEvent'
         AND actor.login IN ({identifier_list})
         AND JSON_EXTRACT_SCALAR(payload, '$.issue.pull_request.url') IS NOT NULL
+        AND JSON_EXTRACT_SCALAR(payload, '$.issue.html_url') IS NOT NULL
 
       UNION ALL
 
@@ -211,6 +213,7 @@ def fetch_all_pr_metadata_single_query(client, identifiers, start_date, end_date
       WHERE
         type = 'PullRequestReviewCommentEvent'
         AND actor.login IN ({identifier_list})
+        AND JSON_EXTRACT_SCALAR(payload, '$.pull_request.html_url') IS NOT NULL
     ),
     
     pr_status AS (
@@ -224,9 +227,10 @@ def fetch_all_pr_metadata_single_query(client, identifiers, start_date, end_date
       FROM (
         {status_tables}
       )
-      WHERE 
+      WHERE
         type = 'PullRequestEvent'
         AND JSON_EXTRACT_SCALAR(payload, '$.action') = 'closed'
+        AND JSON_EXTRACT_SCALAR(payload, '$.pull_request.html_url') IS NOT NULL
         AND JSON_EXTRACT_SCALAR(payload, '$.pull_request.html_url') IN (
           SELECT DISTINCT url FROM review_events
         )
