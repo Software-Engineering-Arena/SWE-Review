@@ -21,7 +21,7 @@ load_dotenv()
 
 AGENTS_REPO = "SWE-Arena/swe_agents"
 REVIEW_METADATA_REPO = "SWE-Arena/review_metadata"
-LEADERBOARD_TIME_FRAME_DAYS = 180  # 6 months
+LEADERBOARD_TIME_FRAME_DAYS = 180  # Time frame for leaderboard
 
 # =============================================================================
 # UTILITY FUNCTIONS
@@ -175,8 +175,41 @@ def fetch_all_pr_metadata_single_query(client, identifiers, start_date, end_date
       FROM (
         {review_tables}
       )
-      WHERE 
+      WHERE
         type = 'PullRequestReviewEvent'
+        AND actor.login IN ({identifier_list})
+
+      UNION ALL
+
+      -- Get PR comments (IssueCommentEvent on PRs)
+      SELECT
+        JSON_EXTRACT_SCALAR(payload, '$.issue.html_url') as url,
+        CAST(created_at AS STRING) as reviewed_at,
+        actor.login as reviewer,
+        repo.name as repo_name,
+        CAST(JSON_EXTRACT_SCALAR(payload, '$.issue.number') AS INT64) as pr_number
+      FROM (
+        {review_tables}
+      )
+      WHERE
+        type = 'IssueCommentEvent'
+        AND actor.login IN ({identifier_list})
+        AND JSON_EXTRACT_SCALAR(payload, '$.issue.pull_request.url') IS NOT NULL
+
+      UNION ALL
+
+      -- Get review comments (PullRequestReviewCommentEvent)
+      SELECT
+        JSON_EXTRACT_SCALAR(payload, '$.pull_request.html_url') as url,
+        CAST(created_at AS STRING) as reviewed_at,
+        actor.login as reviewer,
+        repo.name as repo_name,
+        CAST(JSON_EXTRACT_SCALAR(payload, '$.pull_request.number') AS INT64) as pr_number
+      FROM (
+        {review_tables}
+      )
+      WHERE
+        type = 'PullRequestReviewCommentEvent'
         AND actor.login IN ({identifier_list})
     ),
     
@@ -317,7 +350,7 @@ def save_review_metadata_to_hf(metadata_list, agent_identifier):
         if not token:
             raise Exception("No HuggingFace token found")
 
-        api = HfApi()
+        api = HfApi(token=token)
 
         # Group by date (year, month, day)
         grouped = group_metadata_by_date(metadata_list)
@@ -352,7 +385,6 @@ def save_review_metadata_to_hf(metadata_list, agent_identifier):
                 folder_path=temp_dir,
                 repo_id=REVIEW_METADATA_REPO,
                 repo_type="dataset",
-                token=token,
                 commit_message=f"Update: {agent_identifier} ({len(grouped)} daily files, {len(metadata_list)} total reviews)"
             )
             print(f"   ✓ Batch upload complete for {agent_identifier}")

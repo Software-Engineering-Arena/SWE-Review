@@ -33,7 +33,8 @@ args = parser.parse_args()
 
 AGENTS_REPO = "SWE-Arena/swe_agents"  # HuggingFace dataset for agent metadata
 REVIEW_METADATA_REPO = "SWE-Arena/review_metadata"  # HuggingFace dataset for review metadata
-LEADERBOARD_TIME_FRAME_DAYS = 180  # Time frame for leaderboard
+LEADERBOARD_TIME_FRAME_DAYS = 180  # Time frame for constructing leaderboard
+UPDATE_TIME_FRAME_DAYS = 30  # Time frame for mining new reviews
 
 LEADERBOARD_COLUMNS = [
     ("Agent Name", "string"),
@@ -1711,16 +1712,16 @@ def save_agent_to_hf(data):
 
 def update_all_agents_incremental():
     """
-    Weekly scheduled task for incremental review mining and statistics update.
+    Scheduled task for incremental review mining and statistics update.
 
     Strategy:
-    1. Update PR status for all existing metadata (last LEADERBOARD_TIME_FRAME_DAYS - 7)
-    2. Fetch last week's new reviews
+    1. Update PR status for all existing metadata (last LEADERBOARD_TIME_FRAME_DAYS - UPDATE_TIME_FRAME_DAYS)
+    2. Fetch new reviews from the last UPDATE_TIME_FRAME_DAYS days
     3. Save all updated/new metadata back to HuggingFace
     4. Reload statistics from updated metadata
     """
     print(f"\n{'='*80}")
-    print(f"🕛 Weekly Incremental Update started at {datetime.now(timezone.utc).isoformat()}")
+    print(f"🕛 Incremental Update started at {datetime.now(timezone.utc).isoformat()}")
     print(f"{'='*80}")
 
     try:
@@ -1734,11 +1735,11 @@ def update_all_agents_incremental():
         print(f"\n{'='*80}")
         print(f"📊 Update Summary:")
         print(f"   ✓ Updated existing review statuses")
-        print(f"   ✓ Fetched last week's new reviews")
+        print(f"   ✓ Fetched new reviews from last {UPDATE_TIME_FRAME_DAYS} days")
         print(f"   ✓ Statistics reloaded")
         print(f"{'='*80}")
 
-        print(f"\n✅ Weekly Incremental Update completed at {datetime.now(timezone.utc).isoformat()}")
+        print(f"\n✅ Incremental Update completed at {datetime.now(timezone.utc).isoformat()}")
 
     except Exception as e:
         print(f"✗ Weekly update failed: {str(e)}")
@@ -2061,9 +2062,9 @@ def fetch_and_update_weekly_reviews():
 
     Strategy:
     1. For each agent:
-       - Examine ALL open reviews from last LEADERBOARD_TIME_FRAME_DAYS - 7 for their closed_at status
-       - Update PR status for all existing metadata using BigQuery (last LEADERBOARD_TIME_FRAME_DAYS - 7)
-       - Fetch new reviews from last week using BigQuery
+       - Examine ALL open reviews from last LEADERBOARD_TIME_FRAME_DAYS - UPDATE_TIME_FRAME_DAYS for their closed_at status
+       - Update PR status for all existing metadata using BigQuery (last LEADERBOARD_TIME_FRAME_DAYS - UPDATE_TIME_FRAME_DAYS)
+       - Fetch new reviews from last UPDATE_TIME_FRAME_DAYS days using BigQuery
        - Save all updated/new metadata back to HuggingFace
     """
     # Initialize BigQuery client
@@ -2082,11 +2083,11 @@ def fetch_and_update_weekly_reviews():
     # Calculate date range
     today_utc = datetime.now(timezone.utc)
     today_midnight = datetime.combine(today_utc.date(), datetime.min.time(), tzinfo=timezone.utc)
-    last_week_midnight = today_midnight - timedelta(days=7)
-    cutoff_date = today_midnight - timedelta(days=LEADERBOARD_TIME_FRAME_DAYS - 7)
+    update_start_midnight = today_midnight - timedelta(days=UPDATE_TIME_FRAME_DAYS)
+    cutoff_date = today_midnight - timedelta(days=LEADERBOARD_TIME_FRAME_DAYS - UPDATE_TIME_FRAME_DAYS)
 
     print(f"📅 Time Range Configuration:")
-    print(f"   Last week 12am UTC: {last_week_midnight.isoformat()}")
+    print(f"   Update period start (12am UTC): {update_start_midnight.isoformat()}")
     print(f"   Today 12am UTC: {today_midnight.isoformat()}")
     print(f"   Cutoff for existing reviews: {cutoff_date.isoformat()}")
     print(f"   Examining reviews from: {cutoff_date.date()} to {today_midnight.date()}")
@@ -2105,11 +2106,11 @@ def fetch_and_update_weekly_reviews():
             print(f"{'='*60}")
 
             # Step 1: Load all existing metadata within timeframe
-            print(f"📊 Loading existing metadata from last {LEADERBOARD_TIME_FRAME_DAYS - 1} days...")
+            print(f"📊 Loading existing metadata from last {LEADERBOARD_TIME_FRAME_DAYS - UPDATE_TIME_FRAME_DAYS} days...")
             all_metadata = load_review_metadata()
             agent_metadata = [r for r in all_metadata if r.get("agent_identifier") == identifier]
 
-            # Filter to last LEADERBOARD_TIME_FRAME_DAYS - 1 days (from cutoff to today)
+            # Filter to last (LEADERBOARD_TIME_FRAME_DAYS - UPDATE_TIME_FRAME_DAYS) days (from cutoff to today)
             recent_metadata = []
             for review in agent_metadata:
                 reviewed_at = review.get('reviewed_at', '')
@@ -2124,10 +2125,10 @@ def fetch_and_update_weekly_reviews():
 
             print(f"   ✓ Loaded {len(recent_metadata)} existing reviews from timeframe")
 
-            # Step 2: Fetch NEW reviews from last week to today using BigQuery
-            print(f"🔍 Fetching new reviews from {last_week_midnight.isoformat()} to {today_midnight.isoformat()} using BigQuery...")
+            # Step 2: Fetch NEW reviews from last UPDATE_TIME_FRAME_DAYS to today using BigQuery
+            print(f"🔍 Fetching new reviews from {update_start_midnight.isoformat()} to {today_midnight.isoformat()} using BigQuery...")
 
-            review_rows = fetch_reviews_from_bigquery(client, identifier, last_week_midnight, today_midnight)
+            review_rows = fetch_reviews_from_bigquery(client, identifier, update_start_midnight, today_midnight)
 
             # Extract unique PRs
             urls = list(set([row.url for row in review_rows if row.url]))
@@ -2146,7 +2147,7 @@ def fetch_and_update_weekly_reviews():
                 metadata['agent_identifier'] = identifier
                 weekly_metadata.append(metadata)
 
-            print(f"   ✓ Found {len(weekly_metadata)} unique PRs in 7-day window")
+            print(f"   ✓ Found {len(weekly_metadata)} unique PRs in {UPDATE_TIME_FRAME_DAYS}-day window")
 
             # Step 3: Combine and save all metadata
             all_updated_metadata = recent_metadata + weekly_metadata
@@ -2169,17 +2170,17 @@ def fetch_and_update_weekly_reviews():
 # GRADIO APPLICATION
 # =============================================================================
 
-# Start APScheduler for weekly updates at 12:00 AM UTC every Monday
+# Start APScheduler for incremental updates at 12:00 AM UTC every Monday
 scheduler = BackgroundScheduler(timezone="UTC")
 scheduler.add_job(
     update_all_agents_incremental,
     trigger=CronTrigger(day_of_week='mon', hour=0, minute=0),  # 12:00 AM UTC every Monday
-    id='weekly_review_mining',
-    name='Weekly Regular Review Mining',
+    id='incremental_review_mining',
+    name='Incremental Review Mining',
     replace_existing=True
 )
 scheduler.start()
-print("✓ Scheduler started: Weekly Incremental Update at 12:00 AM UTC every Monday (updates existing metadata + mines last week's reviews)")
+print(f"✓ Scheduler started: Incremental Update at 12:00 AM UTC every Monday (updates existing metadata + mines last {UPDATE_TIME_FRAME_DAYS} days of reviews)")
 
 # Create Gradio interface
 with gr.Blocks(title="SWE Agent Review Leaderboard", theme=gr.themes.Soft()) as app:
