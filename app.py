@@ -25,32 +25,15 @@ load_dotenv()
 
 # Parse command-line arguments
 parser = argparse.ArgumentParser(description='SWE Agent Review Leaderboard')
-parser.add_argument('--debug', '--DEBUG', action='store_true',
-                    help='Enable debug mode (limits review retrieval to 10 per query pattern)')
-parser.add_argument('--no-debug', '--production', action='store_true',
-                    help='Explicitly disable debug mode (force production mode)')
 args = parser.parse_args()
 
 # =============================================================================
 # CONFIGURATION
 # =============================================================================
 
-# DEBUG MODE: Set to True to limit review retrieval for testing
-# When enabled, only fetches up to 10 reviews per query pattern per agent
-# Priority: 1) Command-line args, 2) Environment variable, 3) Default (False)
-if args.no_debug:
-    DEBUG_MODE = False
-elif args.debug:
-    DEBUG_MODE = True
-else:
-    DEBUG_MODE = os.getenv('DEBUG_MODE', 'False').lower() in ('true', '1', 'yes')
-
-# In-memory cache for debug mode (data persists during session but NOT saved to HF)
-DEBUG_REVIEW_METADATA_CACHE = defaultdict(list)
-
 AGENTS_REPO = "SWE-Arena/swe_agents"  # HuggingFace dataset for agent metadata
 REVIEW_METADATA_REPO = "SWE-Arena/review_metadata"  # HuggingFace dataset for review metadata
-LEADERBOARD_TIME_FRAME_DAYS = 180  # Time frame for leaderboard (past 6 months)
+LEADERBOARD_TIME_FRAME_DAYS = 180  # Time frame for leaderboard
 
 LEADERBOARD_COLUMNS = [
     ("Agent Name", "string"),
@@ -191,7 +174,7 @@ def fetch_reviews_from_bigquery(client, identifier, start_date, end_date):
         SELECT
             repo.name as repo_name,
             actor.login as actor_login,
-            JSON_EXTRACT_SCALAR(payload, '$.pull_request.html_url') as pr_url,
+            JSON_EXTRACT_SCALAR(payload, '$.pull_request.url') as url,
             CAST(JSON_EXTRACT_SCALAR(payload, '$.pull_request.number') AS INT64) as pr_number,
             JSON_EXTRACT_SCALAR(payload, '$.review.submitted_at') as reviewed_at,
             created_at
@@ -222,7 +205,7 @@ def fetch_reviews_from_bigquery(client, identifier, start_date, end_date):
         return []
 
 
-def fetch_pr_status_from_bigquery(client, pr_urls, start_date, end_date):
+def fetch_pr_status_from_bigquery(client, urls, start_date, end_date):
     """
     Fetch PR status (merged/closed) from GitHub Archive PullRequestEvent.
 
@@ -231,29 +214,29 @@ def fetch_pr_status_from_bigquery(client, pr_urls, start_date, end_date):
 
     Args:
         client: BigQuery client instance
-        pr_urls: List of PR URLs to check status for
+        urls: List of PR URLs to check status for
         start_date: Start datetime (should cover review period and after)
         end_date: End datetime (should be recent/current)
 
     Returns:
         Dictionary mapping PR URL to status dict:
         {
-            'pr_url': {
+            'url': {
                 'status': 'merged'|'closed'|'open',
                 'merged': bool,
                 'closed_at': timestamp or None
             }
         }
     """
-    if not pr_urls:
+    if not urls:
         return {}
 
-    print(f"\n🔍 Querying BigQuery for PR status ({len(pr_urls)} PRs)...")
+    print(f"\n🔍 Querying BigQuery for PR status ({len(urls)} PRs)...")
 
     # Extract repo and PR number from URLs
     # URL format: https://github.com/owner/repo/pull/123
     pr_info = []
-    for url in pr_urls:
+    for url in urls:
         try:
             parts = url.replace('https://github.com/', '').split('/')
             if len(parts) >= 4:
@@ -305,7 +288,7 @@ def fetch_pr_status_from_bigquery(client, pr_urls, start_date, end_date):
         SELECT
             repo.name as repo_name,
             CAST(JSON_EXTRACT_SCALAR(payload, '$.pull_request.number') AS INT64) as pr_number,
-            JSON_EXTRACT_SCALAR(payload, '$.pull_request.html_url') as pr_url,
+            JSON_EXTRACT_SCALAR(payload, '$.pull_request.url') as url,
             JSON_EXTRACT_SCALAR(payload, '$.action') as action,
             CAST(JSON_EXTRACT_SCALAR(payload, '$.pull_request.merged') AS BOOL) as merged,
             JSON_EXTRACT_SCALAR(payload, '$.pull_request.closed_at') as closed_at,
@@ -331,7 +314,7 @@ def fetch_pr_status_from_bigquery(client, pr_urls, start_date, end_date):
         # Build status map by PR URL
         status_map = {}
         for row in results:
-            pr_url = row.pr_url
+            url = row.url
 
             merged = row.merged if row.merged is not None else False
             closed_at = row.closed_at or row.merged_at
@@ -342,14 +325,14 @@ def fetch_pr_status_from_bigquery(client, pr_urls, start_date, end_date):
 
             status = 'merged' if merged else 'closed'
 
-            status_map[pr_url] = {
+            status_map[url] = {
                 'status': status,
                 'merged': merged,
                 'closed_at': closed_at
             }
 
         # Mark remaining PRs as open
-        for url in pr_urls:
+        for url in urls:
             if url not in status_map:
                 status_map[url] = {
                     'status': 'open',
@@ -368,7 +351,7 @@ def fetch_pr_status_from_bigquery(client, pr_urls, start_date, end_date):
     except Exception as e:
         print(f"   ✗ BigQuery error: {str(e)}")
         # Return all as open on error
-        return {url: {'status': 'open', 'merged': False, 'closed_at': None} for url in pr_urls}
+        return {url: {'status': 'open', 'merged': False, 'closed_at': None} for url in urls}
 
 
 def extract_review_metadata_from_bigquery(review_row, status_info):
@@ -382,7 +365,7 @@ def extract_review_metadata_from_bigquery(review_row, status_info):
     Returns:
         Dictionary with review metadata
     """
-    pr_url = review_row.pr_url
+    url = review_row.url
     pr_number = review_row.pr_number
     reviewed_at = review_row.reviewed_at or review_row.created_at
 
@@ -391,12 +374,12 @@ def extract_review_metadata_from_bigquery(review_row, status_info):
         reviewed_at = reviewed_at.isoformat()
 
     return {
-        'html_url': pr_url,
+        'url': url,
         'reviewed_at': reviewed_at,
         'pr_status': status_info['status'],
-        'pr_merged': status_info['merged'],
-        'pr_closed_at': status_info['closed_at'],
-        'pr_url': pr_url,
+        'merged_at': status_info['merged'],
+        'closed_at': status_info['closed_at'],
+        'url': url,
         'review_id': f"pr_{pr_number}"
     }
 
@@ -703,14 +686,13 @@ def validate_github_username(identifier):
         return False, f"Validation error: {str(e)}"
 
 
-def fetch_reviews_with_time_partition(base_query, start_date, end_date, token_pool, prs_by_url, debug_limit=None, depth=0):
+def fetch_reviews_with_time_partition(base_query, start_date, end_date, token_pool, prs_by_url, depth=0):
     """
     Fetch reviews within a specific time range using time-based partitioning.
     Recursively splits the time range if hitting the 1000-result limit.
     Supports splitting by day, hour, minute, and second as needed.
 
     Args:
-        debug_limit: If set, stops fetching after this many NEW reviews total across all partitions (for testing)
         depth: Current recursion depth (for tracking)
 
     Returns the number of reviews found in this time partition.
@@ -748,10 +730,6 @@ def fetch_reviews_with_time_partition(base_query, start_date, end_date, token_po
     total_in_partition = 0
 
     while True:
-        # Check debug limit GLOBALLY (total unique PRs across all partitions)
-        if debug_limit is not None and len(prs_by_url) >= debug_limit:
-            print(f"{indent}  🐛 DEBUG MODE: Reached global limit of {debug_limit} PRs, stopping...")
-            return total_in_partition
         url = 'https://api.github.com/search/issues'  # Use issues endpoint for PR search
         params = {
             'q': query,
@@ -782,11 +760,11 @@ def fetch_reviews_with_time_partition(base_query, start_date, end_date, token_po
 
             # Add PR reviews to global dict (keyed by PR URL)
             for pr in items:
-                pr_url = pr.get('html_url')
+                url = pr.get('url')
                 pr_number = pr.get('number')
                 # Use PR URL as unique key (more reliable than number alone)
-                if pr_url and pr_url not in prs_by_url:
-                    prs_by_url[pr_url] = pr
+                if url and url not in prs_by_url:
+                    prs_by_url[url] = pr
                     total_in_partition += 1
 
             # Check if we hit the 1000-result limit
@@ -813,7 +791,7 @@ def fetch_reviews_with_time_partition(base_query, start_date, end_date, token_po
                             split_start = split_start + timedelta(seconds=1)
 
                         count = fetch_reviews_with_time_partition(
-                            base_query, split_start, split_end, token_pool, prs_by_url, debug_limit, depth + 1
+                            base_query, split_start, split_end, token_pool, prs_by_url, depth + 1
                         )
                         total_from_splits += count
 
@@ -834,7 +812,7 @@ def fetch_reviews_with_time_partition(base_query, start_date, end_date, token_po
                             split_start = split_start + timedelta(minutes=1)
 
                         count = fetch_reviews_with_time_partition(
-                            base_query, split_start, split_end, token_pool, prs_by_url, debug_limit, depth + 1
+                            base_query, split_start, split_end, token_pool, prs_by_url, depth + 1
                         )
                         total_from_splits += count
 
@@ -855,7 +833,7 @@ def fetch_reviews_with_time_partition(base_query, start_date, end_date, token_po
                             split_start = split_start + timedelta(hours=1)
 
                         count = fetch_reviews_with_time_partition(
-                            base_query, split_start, split_end, token_pool, prs_by_url, debug_limit, depth + 1
+                            base_query, split_start, split_end, token_pool, prs_by_url, depth + 1
                         )
                         total_from_splits += count
 
@@ -886,7 +864,7 @@ def fetch_reviews_with_time_partition(base_query, start_date, end_date, token_po
                                 split_start = split_start + timedelta(days=1)
 
                             count = fetch_reviews_with_time_partition(
-                                base_query, split_start, split_end, token_pool, prs_by_url, debug_limit, depth + 1
+                                base_query, split_start, split_end, token_pool, prs_by_url, depth + 1
                             )
                             total_from_splits += count
 
@@ -897,10 +875,10 @@ def fetch_reviews_with_time_partition(base_query, start_date, end_date, token_po
 
                         # Recursively fetch both halves
                         count1 = fetch_reviews_with_time_partition(
-                            base_query, start_date, mid_date, token_pool, prs_by_url, debug_limit, depth + 1
+                            base_query, start_date, mid_date, token_pool, prs_by_url, depth + 1
                         )
                         count2 = fetch_reviews_with_time_partition(
-                            base_query, mid_date + timedelta(days=1), end_date, token_pool, prs_by_url, debug_limit, depth + 1
+                            base_query, mid_date + timedelta(days=1), end_date, token_pool, prs_by_url, depth + 1
                         )
 
                         return count1 + count2
@@ -922,7 +900,7 @@ def fetch_reviews_with_time_partition(base_query, start_date, end_date, token_po
     return total_in_partition
 
 
-def fetch_reviews_parallel(query_patterns, start_date, end_date, token_pool, prs_by_url, debug_limit=None):
+def fetch_reviews_parallel(query_patterns, start_date, end_date, token_pool, prs_by_url):
     """
     Fetch reviews for multiple query patterns in parallel using available parallel tokens.
 
@@ -936,7 +914,6 @@ def fetch_reviews_parallel(query_patterns, start_date, end_date, token_pool, prs
         end_date: End datetime for time range
         token_pool: TokenPool instance for token management
         prs_by_url: Dictionary to collect PRs by URL (shared across patterns)
-        debug_limit: Optional limit on total PRs to fetch (for testing)
 
     Returns:
         Total number of PRs found across all patterns
@@ -954,7 +931,7 @@ def fetch_reviews_parallel(query_patterns, start_date, end_date, token_pool, prs
         for pattern in query_patterns:
             pattern_prs = {}
             count = fetch_reviews_with_time_partition(
-                pattern, start_date, end_date, token_pool, pattern_prs, debug_limit, depth=0
+                pattern, start_date, end_date, token_pool, pattern_prs, depth=0
             )
             # Merge pattern results into global dict
             with threading.Lock():
@@ -975,7 +952,7 @@ def fetch_reviews_parallel(query_patterns, start_date, end_date, token_pool, prs
         pattern_prs = {}
         try:
             count = fetch_reviews_with_time_partition(
-                pattern, start_date, end_date, token_pool, pattern_prs, debug_limit, depth=0
+                pattern, start_date, end_date, token_pool, pattern_prs, depth=0
             )
             return pattern, pattern_prs, count
         except Exception as e:
@@ -1017,20 +994,20 @@ def fetch_reviews_parallel(query_patterns, start_date, end_date, token_pool, prs
 def extract_review_metadata(pr):
     """
     Extract minimal PR review metadata for efficient storage.
-    Only keeps essential fields: html_url, reviewed_at, pr_status, pr_merged, pr_closed_at.
+    Only keeps essential fields: url, reviewed_at, pr_status, merged_at, closed_at.
     Note: agent_name is not stored as it's inferred from the folder structure.
 
     PR status:
     - pr_status: 'open', 'merged', or 'closed'
-    - pr_merged: True if PR was merged, False otherwise
-    - pr_closed_at: Date when PR was closed/merged (if applicable)
+    - merged_at: True if PR was merged, False otherwise
+    - closed_at: Date when PR was closed/merged (if applicable)
 
     Merged PR = PR that was merged after agent review
     Rejected PR = PR that was closed without merging after agent review
     """
     # Extract PR metadata from search results
     # The GitHub search API returns PR data from /search/issues endpoint
-    pr_url = pr.get('html_url')
+    url = pr.get('url')
     pr_number = pr.get('number')
     created_at = pr.get('created_at')
     closed_at = pr.get('closed_at')
@@ -1041,10 +1018,10 @@ def extract_review_metadata(pr):
 
     # For initial extraction, we don't know if merged yet
     # This will be updated by update_pr_status function
-    pr_merged = pull_request_data.get('merged_at') is not None if pull_request_data else False
+    merged_at = pull_request_data.get('merged_at') is not None if pull_request_data else False
 
     # Determine initial status
-    if pr_merged:
+    if merged_at:
         status = 'merged'
     elif state == 'closed':
         status = 'closed'
@@ -1052,12 +1029,11 @@ def extract_review_metadata(pr):
         status = 'open'
 
     return {
-        'html_url': pr_url,
+        'url': url,
         'reviewed_at': created_at,  # When the PR was created (agent reviewed it)
         'pr_status': status,
-        'pr_merged': pr_merged,
-        'pr_closed_at': closed_at,
-        'pr_url': pr_url,  # Store PR URL for tracking
+        'merged_at': merged_at,
+        'closed_at': closed_at,
         'review_id': f"pr_{pr_number}"  # Use PR number for deduplication
     }
 
@@ -1069,8 +1045,6 @@ def update_pr_status(metadata_list, token_pool):
     For each PR associated with a review, fetch current status from GitHub API.
     Updates metadata_list in-place with PR status information.
 
-    In DEBUG MODE: Skips status updates to avoid API rate limits.
-
     Args:
         metadata_list: List of review metadata dictionaries
         token_pool: TokenPool instance for rotating tokens
@@ -1081,32 +1055,27 @@ def update_pr_status(metadata_list, token_pool):
     if not metadata_list:
         return metadata_list
 
-    # In debug mode, skip status updates to avoid excessive API calls
-    if DEBUG_MODE:
-        print(f"   🐛 DEBUG MODE: Skipping PR status updates for {len(metadata_list)} reviews")
-        return metadata_list
-
     # Track unique PRs to avoid duplicate API calls
-    pr_url_to_status = {}
+    url_to_status = {}
     updated_count = 0
 
     for metadata in metadata_list:
-        pr_url = metadata.get('pr_url')
-        if not pr_url:
+        url = metadata.get('url')
+        if not url:
             continue
 
         # Skip if already fetched for this PR
-        if pr_url in pr_url_to_status:
-            status_info = pr_url_to_status[pr_url]
+        if url in url_to_status:
+            status_info = url_to_status[url]
             metadata['pr_status'] = status_info['status']
-            metadata['pr_merged'] = status_info['merged']
-            metadata['pr_closed_at'] = status_info['closed_at']
+            metadata['merged_at'] = status_info['merged']
+            metadata['closed_at'] = status_info['closed_at']
             continue
 
         try:
             # Convert HTML URL to API URL
             # https://github.com/owner/repo/pull/123 -> https://api.github.com/repos/owner/repo/pulls/123
-            parts = pr_url.replace('https://github.com/', '').split('/')
+            parts = url.replace('https://github.com/', '').split('/')
             if len(parts) >= 4:
                 owner, repo, pull_word, pr_number = parts[0], parts[1], parts[2], parts[3]
                 api_url = f'https://api.github.com/repos/{owner}/{repo}/pulls/{pr_number}'
@@ -1137,17 +1106,17 @@ def update_pr_status(metadata_list, token_pool):
                     }
 
                     # Cache and update
-                    pr_url_to_status[pr_url] = status_info
+                    url_to_status[url] = status_info
                     metadata['pr_status'] = status
-                    metadata['pr_merged'] = merged
-                    metadata['pr_closed_at'] = closed_at or merged_at
+                    metadata['merged_at'] = merged
+                    metadata['closed_at'] = closed_at or merged_at
                     updated_count += 1
 
                 # Small delay to avoid rate limiting
                 time.sleep(0.1)
 
         except Exception as e:
-            print(f"   Warning: Could not check PR status for {pr_url}: {e}")
+            print(f"   Warning: Could not check PR status for {url}: {e}")
             continue
 
     if updated_count > 0:
@@ -1158,33 +1127,57 @@ def update_pr_status(metadata_list, token_pool):
 
 
 
+def get_pr_status_from_metadata(review_meta):
+    """
+    Derive PR status from merged_at and closed_at fields.
+
+    Args:
+        review_meta: Dictionary containing merged_at and closed_at fields
+
+    Returns:
+        str: 'merged', 'closed', or 'open'
+    """
+    merged_at = review_meta.get('merged_at')
+    closed_at = review_meta.get('closed_at')
+
+    # If merged_at is set (not None and not False), PR is merged
+    if merged_at:
+        return 'merged'
+    # If closed_at is set but not merged, PR is closed without merging
+    elif closed_at:
+        return 'closed'
+    # Otherwise, PR is still open
+    else:
+        return 'open'
+
+
 def calculate_review_stats_from_metadata(metadata_list):
     """
     Calculate statistics from a list of review metadata (lightweight objects).
-    Works with minimal metadata: html_url, reviewed_at, pr_status, pr_merged, pr_closed_at.
+    Works with minimal metadata: url, reviewed_at, merged_at, closed_at.
 
     Returns a dictionary with comprehensive review metrics.
 
     Acceptance Rate is calculated as:
         merged PRs / (merged PRs + rejected PRs) * 100
 
-    Merged PRs = PRs that were merged (pr_status='merged')
-    Rejected PRs = PRs that were closed without merging (pr_status='closed')
-    Pending PRs = PRs still open (pr_status='open') - excluded from acceptance rate
+    Merged PRs = PRs that were merged (merged_at is not None)
+    Rejected PRs = PRs that were closed without merging (closed_at is not None but merged_at is None)
+    Pending PRs = PRs still open (both merged_at and closed_at are None) - excluded from acceptance rate
     """
     total_reviews = len(metadata_list)
 
-    # Count merged PRs (merged)
+    # Count merged PRs (merged_at is set)
     merged_prs = sum(1 for review_meta in metadata_list
-                      if review_meta.get('pr_status') == 'merged')
+                      if get_pr_status_from_metadata(review_meta) == 'merged')
 
     # Count rejected PRs (closed without merging)
     rejected_prs = sum(1 for review_meta in metadata_list
-                      if review_meta.get('pr_status') == 'closed')
+                      if get_pr_status_from_metadata(review_meta) == 'closed')
 
     # Count pending PRs (still open)
     pending_prs = sum(1 for review_meta in metadata_list
-                     if review_meta.get('pr_status') == 'open')
+                     if get_pr_status_from_metadata(review_meta) == 'open')
 
     # Calculate acceptance rate (exclude pending PRs)
     completed_prs = merged_prs + rejected_prs
@@ -1198,10 +1191,14 @@ def calculate_review_stats_from_metadata(metadata_list):
     }
 
 
-def calculate_monthly_metrics_by_agent():
+def calculate_monthly_metrics_by_agent(top_n=None):
     """
-    Calculate monthly metrics for all agents for visualization.
+    Calculate monthly metrics for all agents (or top N agents) for visualization.
     Loads data directly from SWE-Arena/review_metadata dataset.
+
+    Args:
+        top_n: If specified, only return metrics for the top N agents by total reviews.
+               Agents are ranked by their total review count across all months.
 
     Returns:
         dict: {
@@ -1220,7 +1217,7 @@ def calculate_monthly_metrics_by_agent():
     agents = load_agents_from_hf()
 
     # Create mapping from agent_identifier to agent_name
-    identifier_to_name = {agent.get('github_identifier'): agent.get('agent_name') for agent in agents if agent.get('github_identifier')}
+    identifier_to_name = {agent.get('github_identifier'): agent.get('name') for agent in agents if agent.get('github_identifier')}
 
     # Load all review metadata from review_metadata dataset
     all_metadata = load_review_metadata()
@@ -1290,8 +1287,25 @@ def calculate_monthly_metrics_by_agent():
             'merged_prs': merged_prs_list,
         }
 
+    # Filter to top N agents if specified
+    agents_list = sorted(list(agent_month_data.keys()))
+    if top_n is not None and top_n > 0:
+        # Calculate total reviews for each agent across all months
+        agent_totals = []
+        for agent_name in agents_list:
+            total_reviews = sum(result_data[agent_name]['total_reviews'])
+            agent_totals.append((agent_name, total_reviews))
+
+        # Sort by total reviews (descending) and take top N
+        agent_totals.sort(key=lambda x: x[1], reverse=True)
+        top_agents = [agent_name for agent_name, _ in agent_totals[:top_n]]
+
+        # Filter result_data to only include top agents
+        result_data = {agent: result_data[agent] for agent in top_agents if agent in result_data}
+        agents_list = top_agents
+
     return {
-        'agents': sorted(list(agent_month_data.keys())),
+        'agents': agents_list,
         'months': months,
         'data': result_data
     }
@@ -1327,7 +1341,6 @@ def save_review_metadata_to_hf(metadata_list, agent_identifier):
     """
     Save review metadata to HuggingFace dataset, organized by [agent_identifier]/YYYY.MM.DD.jsonl.
     Each file is stored in the agent's folder and named YYYY.MM.DD.jsonl for that day's reviews.
-    In debug mode, saves to in-memory cache only.
 
     This function APPENDS new metadata and DEDUPLICATES by review_id.
     Uses batch upload to avoid rate limit (uploads entire folder in single commit).
@@ -1338,17 +1351,6 @@ def save_review_metadata_to_hf(metadata_list, agent_identifier):
     """
     import tempfile
     import shutil
-
-    # Skip saving to HF in debug mode - use in-memory cache instead
-    if DEBUG_MODE:
-        global DEBUG_REVIEW_METADATA_CACHE
-        # Merge with existing cache, deduplicating by review_id
-        existing = {review['review_id']: review for review in DEBUG_REVIEW_METADATA_CACHE[agent_identifier] if review.get('review_id')}
-        new = {review['review_id']: review for review in metadata_list if review.get('review_id')}
-        existing.update(new)
-        DEBUG_REVIEW_METADATA_CACHE[agent_identifier] = list(existing.values())
-        print(f"🐛 DEBUG MODE: Saved to in-memory cache only ({len(metadata_list)} reviews) - NOT saved to HuggingFace")
-        return True
 
     try:
         token = get_hf_token()
@@ -1428,8 +1430,6 @@ def load_review_metadata():
     """
     Load review metadata from the last LEADERBOARD_TIME_FRAME_DAYS.
 
-    In debug mode, loads from in-memory cache if available and filters by time frame.
-
     Structure: [agent_identifier]/YYYY.MM.DD.jsonl
 
     Returns:
@@ -1439,28 +1439,6 @@ def load_review_metadata():
     # Calculate cutoff date based on LEADERBOARD_TIME_FRAME_DAYS
     current_time = datetime.now(timezone.utc)
     cutoff_date = current_time - timedelta(days=LEADERBOARD_TIME_FRAME_DAYS)
-
-    # In debug mode, check in-memory cache first
-    if DEBUG_MODE and DEBUG_REVIEW_METADATA_CACHE:
-        all_metadata = []
-        for agent_identifier, metadata_list in DEBUG_REVIEW_METADATA_CACHE.items():
-            for review_meta in metadata_list:
-                # Filter by time frame
-                reviewed_at = review_meta.get('reviewed_at')
-                if reviewed_at:
-                    try:
-                        dt = datetime.fromisoformat(reviewed_at.replace('Z', '+00:00'))
-                        if dt < cutoff_date:
-                            continue  # Skip reviews older than time frame
-                    except Exception:
-                        pass  # Keep reviews with unparseable dates
-
-                review_with_agent = review_meta.copy()
-                review_with_agent['agent_identifier'] = agent_identifier
-                all_metadata.append(review_with_agent)
-        if all_metadata:
-            print(f"🐛 DEBUG MODE: Loading review metadata from in-memory cache (last {LEADERBOARD_TIME_FRAME_DAYS} days, {len(all_metadata)} reviews)")
-            return all_metadata
 
     try:
         api = HfApi()
@@ -1495,6 +1473,8 @@ def load_review_metadata():
         print(f"📥 Loading review metadata from last {LEADERBOARD_TIME_FRAME_DAYS} days ({len(time_frame_files)} daily files across all agents)...")
 
         all_metadata = []
+        agent_identifiers_found = set()
+
         for filename in time_frame_files:
             try:
                 # Extract agent_identifier from path (first part)
@@ -1505,6 +1485,7 @@ def load_review_metadata():
                     continue
 
                 agent_identifier = parts[0]
+                agent_identifiers_found.add(agent_identifier)
 
                 file_path = hf_hub_download(
                     repo_id=REVIEW_METADATA_REPO,
@@ -1536,6 +1517,14 @@ def load_review_metadata():
                 print(f"   Warning: Could not load {filename}: {str(e)}")
 
         print(f"✓ Loaded {len(all_metadata)} total reviews from last {LEADERBOARD_TIME_FRAME_DAYS} days")
+
+        # DEBUG: Show unique agent identifiers found in review folders
+        if agent_identifiers_found:
+            print(f"📋 Agent identifiers found in review metadata folders:")
+            for identifier in sorted(agent_identifiers_found):
+                count = sum(1 for r in all_metadata if r.get('agent_identifier') == identifier)
+                print(f"   - '{identifier}': {count} reviews")
+
         return all_metadata
 
     except Exception as e:
@@ -1601,13 +1590,12 @@ def get_latest_review_date_for_agent(agent_identifier):
         return None
 
 
-def get_daily_files_last_n_months(agent_identifier, n_months=6):
+def get_daily_files_last_time_frame(agent_identifier):
     """
-    Get list of daily file paths for an agent from the last N months.
+    Get list of daily file paths for an agent from the configured time frame.
 
     Args:
         agent_identifier: GitHub identifier of the agent
-        n_months: Number of months to look back (default: 6)
 
     Returns:
         List of file paths in format: [agent_identifier]/YYYY.MM.DD.jsonl
@@ -1616,9 +1604,9 @@ def get_daily_files_last_n_months(agent_identifier, n_months=6):
         api = HfApi()
         token = get_hf_token()
 
-        # Calculate date range
+        # Calculate date range using configured time frame
         today = datetime.now(timezone.utc)
-        n_months_ago = today - timedelta(days=30 * n_months)
+        cutoff_date = today - timedelta(days=LEADERBOARD_TIME_FRAME_DAYS)
 
         # List all files in the repository
         files = api.list_repo_files(repo_id=REVIEW_METADATA_REPO, repo_type="dataset")
@@ -1644,8 +1632,8 @@ def get_daily_files_last_n_months(agent_identifier, n_months=6):
                 file_year, file_month, file_day = map(int, date_components)
                 file_date = datetime(file_year, file_month, file_day, tzinfo=timezone.utc)
 
-                # Include if within last n_months
-                if n_months_ago <= file_date <= today:
+                # Include if within configured time frame
+                if cutoff_date <= file_date <= today:
                     recent_files.append(filename)
             except Exception:
                 continue
@@ -1704,7 +1692,7 @@ def fetch_review_current_status(review_url, token):
 
 def refresh_review_status_for_agent(agent_identifier, token):
     """
-    Refresh status for all open reviews from the last 6 months for an agent.
+    Refresh status for all open reviews from the last month for an agent.
     Only updates reviews that are still open (state="open" or no state_reason).
 
     This implements the smart update strategy:
@@ -1719,11 +1707,11 @@ def refresh_review_status_for_agent(agent_identifier, token):
     Returns:
         Tuple: (total_checked, updated_count)
     """
-    print(f"\n🔄 Refreshing open reviews for {agent_identifier} (last 6 months)...")
+    print(f"\n🔄 Refreshing open reviews for {agent_identifier} (last month)...")
 
     try:
-        # Get daily files from last 6 months
-        recent_files = get_daily_files_last_n_months(agent_identifier, n_months=6)
+        # Get daily files from configured time frame
+        recent_files = get_daily_files_last_time_frame(agent_identifier)
 
         if not recent_files:
             print(f"   No recent files found for {agent_identifier}")
@@ -1760,7 +1748,7 @@ def refresh_review_status_for_agent(agent_identifier, token):
                         continue
 
                     # Review may have been reverted, check status
-                    review_url = review.get("html_url")
+                    review_url = review.get("url")
 
                     if not review_url:
                         updated_reviews.append(review)
@@ -1848,6 +1836,16 @@ def load_agents_from_hf():
 
                 with open(file_path, 'r') as f:
                     agent_data = json.load(f)
+
+                    # Extract github_identifier from filename (e.g., "claude[bot].json" -> "claude[bot]")
+                    filename_identifier = json_file.replace('.json', '')
+
+                    # Add or override github_identifier to match filename
+                    agent_data['github_identifier'] = filename_identifier
+
+                    # DEBUG: Log the identifier being used
+                    print(f"   ✓ Loaded agent: '{filename_identifier}' -> {agent_data.get('name', 'Unknown')}")
+
                     agents.append(agent_data)
 
             except Exception as e:
@@ -1961,21 +1959,21 @@ def save_agent_to_hf(data):
 
 def update_all_agents_incremental():
     """
-    Daily scheduled task for incremental review mining and statistics update.
+    Weekly scheduled task for incremental review mining and statistics update.
 
     Strategy:
-    1. Update PR status for all existing metadata (last LEADERBOARD_TIME_FRAME_DAYS - 1)
-    2. Fetch yesterday's new reviews
+    1. Update PR status for all existing metadata (last LEADERBOARD_TIME_FRAME_DAYS - 7)
+    2. Fetch last week's new reviews
     3. Save all updated/new metadata back to HuggingFace
     4. Reload statistics from updated metadata
     """
     print(f"\n{'='*80}")
-    print(f"🕛 Daily Incremental Update started at {datetime.now(timezone.utc).isoformat()}")
+    print(f"🕛 Weekly Incremental Update started at {datetime.now(timezone.utc).isoformat()}")
     print(f"{'='*80}")
 
     try:
         # Fetch and update reviews
-        fetch_and_update_daily_reviews()
+        fetch_and_update_weekly_reviews()
 
         # Reload statistics from updated metadata
         print(f"\n📋 Reloading statistics from updated review metadata...")
@@ -1984,14 +1982,14 @@ def update_all_agents_incremental():
         print(f"\n{'='*80}")
         print(f"📊 Update Summary:")
         print(f"   ✓ Updated existing review statuses")
-        print(f"   ✓ Fetched yesterday's new reviews")
+        print(f"   ✓ Fetched last week's new reviews")
         print(f"   ✓ Statistics reloaded")
         print(f"{'='*80}")
 
-        print(f"\n✅ Daily Incremental Update completed at {datetime.now(timezone.utc).isoformat()}")
+        print(f"\n✅ Weekly Incremental Update completed at {datetime.now(timezone.utc).isoformat()}")
 
     except Exception as e:
-        print(f"✗ Daily update failed: {str(e)}")
+        print(f"✗ Weekly update failed: {str(e)}")
         import traceback
         traceback.print_exc()
 
@@ -2004,23 +2002,38 @@ def construct_leaderboard_from_metadata():
     Returns dictionary of agent stats.
     """
     print("📊 Constructing leaderboard from review metadata...")
+
     # Load agents
     agents = load_agents_from_hf()
     if not agents:
-        print("No agents found")
+        print("⚠️ No agents found")
         return {}
+
+    print(f"✓ Loaded {len(agents)} agents")
 
     # Load all review metadata
     all_metadata = load_review_metadata()
+    print(f"✓ Loaded {len(all_metadata)} review metadata entries")
+
+    # Debug: Check what agent_identifiers exist in review metadata
+    if all_metadata:
+        review_identifiers = set(r.get('agent_identifier') for r in all_metadata if r.get('agent_identifier'))
+        print(f"   Unique agent_identifiers in reviews: {review_identifiers}")
+    else:
+        print("⚠️ No review metadata loaded!")
 
     cache_dict = {}
 
     for agent in agents:
         identifier = agent.get('github_identifier')
-        agent_name = agent.get('agent_name', 'Unknown')
+        agent_name = agent.get('name', 'Unknown')
 
         # Filter metadata for this agent
         agent_metadata = [review for review in all_metadata if review.get("agent_identifier") == identifier]
+
+        # Debug output
+        if len(agent_metadata) > 0:
+            print(f"   ✓ Agent '{identifier}' matched {len(agent_metadata)} reviews")
 
         # Calculate stats
         stats = calculate_review_stats_from_metadata(agent_metadata)
@@ -2032,6 +2045,8 @@ def construct_leaderboard_from_metadata():
             **stats
         }
 
+    print(f"✓ Constructed cache with {len(cache_dict)} agent entries")
+
     return cache_dict
 
 
@@ -2039,15 +2054,18 @@ def construct_leaderboard_from_metadata():
 # UI FUNCTIONS
 # =============================================================================
 
-def create_monthly_metrics_plot():
+def create_monthly_metrics_plot(top_n=None):
     """
     Create a Plotly figure with dual y-axes showing:
     - Left y-axis: Acceptance Rate (%) as line curves
     - Right y-axis: Total Reviews created as bar charts
 
     Each agent gets a unique color for both their line and bars.
+
+    Args:
+        top_n: If specified, only show metrics for the top N agents by total reviews.
     """
-    metrics = calculate_monthly_metrics_by_agent()
+    metrics = calculate_monthly_metrics_by_agent(top_n=top_n)
 
     if not metrics['agents'] or not metrics['months']:
         # Return an empty figure with a message
@@ -2104,7 +2122,7 @@ def create_monthly_metrics_plot():
                     line=dict(color=color, width=2),
                     marker=dict(size=8),
                     legendgroup=agent_name,
-                    showlegend=False,  # Hide legend for 70+ agents
+                    showlegend=(top_n is not None and top_n <= 10),  # Show legend for top N agents
                     hovertemplate='<b>Agent: %{fullData.name}</b><br>' +
                                  'Month: %{x}<br>' +
                                  'Acceptance Rate: %{y:.2f}%<br>' +
@@ -2130,7 +2148,7 @@ def create_monthly_metrics_plot():
                     name=agent_name,
                     marker=dict(color=color, opacity=0.6),
                     legendgroup=agent_name,
-                    showlegend=False,  # Hide legend for 70+ agents
+                    showlegend=False,  # Hide duplicate legend entry (already shown in Scatter)
                     hovertemplate='<b>Agent: %{fullData.name}</b><br>' +
                                  'Month: %{x}<br>' +
                                  'Total Reviews: %{y}<br>' +
@@ -2146,13 +2164,14 @@ def create_monthly_metrics_plot():
     fig.update_yaxes(title_text="<b>Total Reviews</b>", secondary_y=True)
 
     # Update layout
+    show_legend = (top_n is not None and top_n <= 10)
     fig.update_layout(
         title=None,
         hovermode='closest',  # Show individual agent info on hover
         barmode='group',
         height=600,
-        showlegend=False,  # Hide legend for 70+ agents
-        margin=dict(l=50, r=50, t=50, b=50)  # Reduced top margin since no legend
+        showlegend=show_legend,
+        margin=dict(l=50, r=150 if show_legend else 50, t=50, b=50)  # More right margin when legend is shown
     )
 
     return fig
@@ -2163,27 +2182,43 @@ def get_leaderboard_dataframe():
     Construct leaderboard from review metadata and convert to pandas DataFrame for display.
     Returns formatted DataFrame sorted by retention rate.
     """
+    print("\n" + "="*60)
+    print("🔍 DEBUG: get_leaderboard_dataframe() called")
+    print("="*60)
+
     # Construct leaderboard from metadata
     cache_dict = construct_leaderboard_from_metadata()
 
+    print(f"📊 Cache dict size: {len(cache_dict)}")
+
     if not cache_dict:
+        print("⚠️ WARNING: cache_dict is empty!")
         # Return empty DataFrame with correct columns if no data
         column_names = [col[0] for col in LEADERBOARD_COLUMNS]
         return pd.DataFrame(columns=column_names)
 
     rows = []
-    for data in cache_dict.values():
+    filtered_count = 0
+    for identifier, data in cache_dict.items():
+        total_reviews = data.get('total_reviews', 0)
+        print(f"   Agent '{identifier}': {total_reviews} reviews")
+
         # Filter out agents with zero total reviews
-        if data.get('total_reviews', 0) == 0:
+        if total_reviews == 0:
+            filtered_count += 1
             continue
+
         # Only include display-relevant fields
         rows.append([
             data.get('agent_name', 'Unknown'),
             data.get('website', 'N/A'),
-            data.get('total_reviews', 0),
+            total_reviews,
             data.get('merged_prs', 0),
             data.get('acceptance_rate', 0.0),
         ])
+
+    print(f"📉 Filtered out {filtered_count} agents with 0 reviews")
+    print(f"📈 Leaderboard will show {len(rows)} agents")
 
     # Create DataFrame
     column_names = [col[0] for col in LEADERBOARD_COLUMNS]
@@ -2199,6 +2234,9 @@ def get_leaderboard_dataframe():
     if "Acceptance Rate (%)" in df.columns and not df.empty:
         df = df.sort_values(by="Acceptance Rate (%)", ascending=False).reset_index(drop=True)
 
+    print(f"✅ Final DataFrame shape: {df.shape}")
+    print("="*60 + "\n")
+
     return df
 
 
@@ -2209,13 +2247,13 @@ def submit_agent(identifier, agent_name, organization, description, website):
     """
     # Validate required fields
     if not identifier or not identifier.strip():
-        return "❌ GitHub identifier is required", get_leaderboard_dataframe(), create_monthly_metrics_plot()
+        return "❌ GitHub identifier is required", get_leaderboard_dataframe()
     if not agent_name or not agent_name.strip():
-        return "❌ Agent name is required", get_leaderboard_dataframe(), create_monthly_metrics_plot()
+        return "❌ Agent name is required", get_leaderboard_dataframe()
     if not organization or not organization.strip():
-        return "❌ Organization name is required", get_leaderboard_dataframe(), create_monthly_metrics_plot()
+        return "❌ Organization name is required", get_leaderboard_dataframe()
     if not website or not website.strip():
-        return "❌ Website URL is required", get_leaderboard_dataframe(), create_monthly_metrics_plot()
+        return "❌ Website URL is required", get_leaderboard_dataframe()
 
     # Clean inputs
     identifier = identifier.strip()
@@ -2227,14 +2265,14 @@ def submit_agent(identifier, agent_name, organization, description, website):
     # Validate GitHub identifier
     is_valid, message = validate_github_username(identifier)
     if not is_valid:
-        return f"❌ {message}", get_leaderboard_dataframe(), create_monthly_metrics_plot()
+        return f"❌ {message}", get_leaderboard_dataframe()
 
     # Check for duplicates by loading agents from HuggingFace
     agents = load_agents_from_hf()
     if agents:
         existing_names = {agent['github_identifier'] for agent in agents}
         if identifier in existing_names:
-            return f"⚠️ Agent with identifier '{identifier}' already exists", get_leaderboard_dataframe(), create_monthly_metrics_plot()
+            return f"⚠️ Agent with identifier '{identifier}' already exists", get_leaderboard_dataframe()
 
     # Create submission
     submission = {
@@ -2247,25 +2285,25 @@ def submit_agent(identifier, agent_name, organization, description, website):
 
     # Save to HuggingFace
     if not save_agent_to_hf(submission):
-        return "❌ Failed to save submission", get_leaderboard_dataframe(), create_monthly_metrics_plot()
+        return "❌ Failed to save submission", get_leaderboard_dataframe()
 
     # Return success message - data will be populated by daily incremental updates
-    return f"✅ Successfully submitted {agent_name}! Review data will be populated by the next daily incremental update.", get_leaderboard_dataframe(), create_monthly_metrics_plot()
+    return f"✅ Successfully submitted {agent_name}! Review data will be populated by the next daily incremental update.", get_leaderboard_dataframe()
 
 
 # =============================================================================
 # BACKGROUND TASKS
 # =============================================================================
 
-def fetch_and_update_daily_reviews():
+def fetch_and_update_weekly_reviews():
     """
     Fetch and update reviews with comprehensive status checking using BigQuery.
 
     Strategy:
     1. For each agent:
-       - Examine ALL open reviews from last LEADERBOARD_TIME_FRAME_DAYS - 1 for their closed_at status
-       - Update PR status for all existing metadata using BigQuery (last LEADERBOARD_TIME_FRAME_DAYS - 1)
-       - Fetch new reviews from yesterday 12am to today 12am using BigQuery
+       - Examine ALL open reviews from last LEADERBOARD_TIME_FRAME_DAYS - 7 for their closed_at status
+       - Update PR status for all existing metadata using BigQuery (last LEADERBOARD_TIME_FRAME_DAYS - 7)
+       - Fetch new reviews from last week using BigQuery
        - Save all updated/new metadata back to HuggingFace
     """
     # Initialize BigQuery client
@@ -2284,18 +2322,18 @@ def fetch_and_update_daily_reviews():
     # Calculate date range
     today_utc = datetime.now(timezone.utc)
     today_midnight = datetime.combine(today_utc.date(), datetime.min.time(), tzinfo=timezone.utc)
-    yesterday_midnight = today_midnight - timedelta(days=1)
-    cutoff_date = today_midnight - timedelta(days=LEADERBOARD_TIME_FRAME_DAYS - 1)
+    last_week_midnight = today_midnight - timedelta(days=7)
+    cutoff_date = today_midnight - timedelta(days=LEADERBOARD_TIME_FRAME_DAYS - 7)
 
     print(f"📅 Time Range Configuration:")
-    print(f"   Yesterday 12am UTC: {yesterday_midnight.isoformat()}")
+    print(f"   Last week 12am UTC: {last_week_midnight.isoformat()}")
     print(f"   Today 12am UTC: {today_midnight.isoformat()}")
     print(f"   Cutoff for existing reviews: {cutoff_date.isoformat()}")
     print(f"   Examining reviews from: {cutoff_date.date()} to {today_midnight.date()}")
 
     for agent in agents:
         identifier = agent.get('github_identifier')
-        agent_name = agent.get('agent_name', 'Unknown')
+        agent_name = agent.get('name', 'Unknown')
 
         if not identifier:
             print(f"Warning: Skipping agent without identifier: {agent}")
@@ -2330,46 +2368,46 @@ def fetch_and_update_daily_reviews():
             if recent_metadata:
                 print(f"🔍 Updating PR status for {len(recent_metadata)} existing reviews using BigQuery...")
                 # Extract PR URLs from existing metadata
-                pr_urls = [r.get('pr_url') for r in recent_metadata if r.get('pr_url')]
-                if pr_urls:
+                urls = [r.get('url') for r in recent_metadata if r.get('url')]
+                if urls:
                     # Fetch status from BigQuery
                     extended_end_date = today_utc
-                    status_map = fetch_pr_status_from_bigquery(client, pr_urls, cutoff_date, extended_end_date)
+                    status_map = fetch_pr_status_from_bigquery(client, urls, cutoff_date, extended_end_date)
 
                     # Update metadata with new status
                     for review in recent_metadata:
-                        pr_url = review.get('pr_url')
-                        if pr_url and pr_url in status_map:
-                            status_info = status_map[pr_url]
+                        url = review.get('url')
+                        if url and url in status_map:
+                            status_info = status_map[url]
                             review['pr_status'] = status_info['status']
-                            review['pr_merged'] = status_info['merged']
-                            review['pr_closed_at'] = status_info['closed_at']
+                            review['merged_at'] = status_info['merged']
+                            review['closed_at'] = status_info['closed_at']
 
                     print(f"   ✓ Updated PR status for existing reviews")
 
-            # Step 3: Fetch NEW reviews from yesterday 12am to today 12am using BigQuery
-            print(f"🔍 Fetching new reviews from {yesterday_midnight.isoformat()} to {today_midnight.isoformat()} using BigQuery...")
+            # Step 3: Fetch NEW reviews from last week to today using BigQuery
+            print(f"🔍 Fetching new reviews from {last_week_midnight.isoformat()} to {today_midnight.isoformat()} using BigQuery...")
 
-            review_rows = fetch_reviews_from_bigquery(client, identifier, yesterday_midnight, today_midnight)
+            review_rows = fetch_reviews_from_bigquery(client, identifier, last_week_midnight, today_midnight)
 
             # Extract unique PR URLs and fetch status
-            pr_urls = list(set([row.pr_url for row in review_rows if row.pr_url]))
-            print(f"   Found {len(review_rows)} review events across {len(pr_urls)} unique PRs")
+            urls = list(set([row.url for row in review_rows if row.url]))
+            print(f"   Found {len(review_rows)} review events across {len(urls)} unique PRs")
 
             # Fetch PR status for new reviews
             extended_end_date = today_utc
-            status_map = fetch_pr_status_from_bigquery(client, pr_urls, yesterday_midnight, extended_end_date)
+            status_map = fetch_pr_status_from_bigquery(client, urls, last_week_midnight, extended_end_date)
 
             # Extract metadata for new reviews
-            yesterday_metadata = []
+            weekly_metadata = []
             seen_prs = set()
             for row in review_rows:
-                pr_url = row.pr_url
-                if pr_url in seen_prs:
+                url = row.url
+                if url in seen_prs:
                     continue
-                seen_prs.add(pr_url)
+                seen_prs.add(url)
 
-                status_info = status_map.get(pr_url, {
+                status_info = status_map.get(url, {
                     'status': 'open',
                     'merged': False,
                     'closed_at': None
@@ -2377,17 +2415,17 @@ def fetch_and_update_daily_reviews():
 
                 metadata = extract_review_metadata_from_bigquery(row, status_info)
                 metadata['agent_identifier'] = identifier
-                yesterday_metadata.append(metadata)
+                weekly_metadata.append(metadata)
 
-            print(f"   ✓ Found {len(yesterday_metadata)} unique PRs in 24-hour window")
+            print(f"   ✓ Found {len(weekly_metadata)} unique PRs in 7-day window")
 
             # Step 4: Combine and save all metadata
-            all_updated_metadata = recent_metadata + yesterday_metadata
+            all_updated_metadata = recent_metadata + weekly_metadata
 
             if all_updated_metadata:
                 print(f"💾 Saving {len(all_updated_metadata)} total reviews to HuggingFace...")
                 save_review_metadata_to_hf(all_updated_metadata, identifier)
-                print(f"✓ Updated {identifier}: {len(recent_metadata)} existing (status checked) + {len(yesterday_metadata)} new = {len(all_updated_metadata)} total")
+                print(f"✓ Updated {identifier}: {len(recent_metadata)} existing (status checked) + {len(weekly_metadata)} new = {len(all_updated_metadata)} total")
             else:
                 print(f"   No reviews to save for {identifier}")
 
@@ -2402,65 +2440,57 @@ def fetch_and_update_daily_reviews():
 # GRADIO APPLICATION
 # =============================================================================
 
-# Initialize data before creating UI
-if DEBUG_MODE:
-    print("\n" + "="*80)
-    print("🐛 DEBUG MODE ENABLED 🐛")
-    print("="*80)
-    print("Review retrieval is limited to 10 reviews per query pattern per agent")
-
-    # Show how debug mode was enabled
-    if args.debug:
-        print("Enabled via: command-line flag '--debug'")
-        print("To disable: run without '--debug' flag")
-    else:
-        print("Enabled via: DEBUG_MODE environment variable")
-        print("To disable: run with '--no-debug' flag or unset DEBUG_MODE")
-
-    print("="*80 + "\n")
-else:
-    print("\n🚀 Starting in PRODUCTION MODE - full review retrieval enabled")
-    if args.no_debug:
-        print("   (Explicitly set via '--no-debug' flag)")
-    print()
-
-# Start APScheduler for daily updates at 12:00 AM UTC
+# Start APScheduler for weekly updates at 12:00 AM UTC every Monday
 scheduler = BackgroundScheduler(timezone="UTC")
 scheduler.add_job(
     update_all_agents_incremental,
-    trigger=CronTrigger(hour=0, minute=0),  # 12:00 AM UTC daily
-    id='daily_review_mining',
-    name='Daily Regular Review Mining',
+    trigger=CronTrigger(day_of_week='mon', hour=0, minute=0),  # 12:00 AM UTC every Monday
+    id='weekly_review_mining',
+    name='Weekly Regular Review Mining',
     replace_existing=True
 )
 scheduler.start()
-print("✓ Scheduler started: Daily Incremental Update at 12:00 AM UTC (updates existing metadata + mines yesterday's reviews)")
+print("✓ Scheduler started: Weekly Incremental Update at 12:00 AM UTC every Monday (updates existing metadata + mines last week's reviews)")
 
 # Create Gradio interface
 with gr.Blocks(title="SWE Agent Review Leaderboard", theme=gr.themes.Soft()) as app:
 
     gr.Markdown("# 🏆 SWE Agent Review Leaderboard")
-    gr.Markdown("Track and compare GitHub PR review acceptance statistics for SWE agents (last 6 months)")
+    gr.Markdown("Track and compare GitHub PR review acceptance statistics for SWE agents (last month)")
     
     with gr.Tabs():
-        
+
         # Leaderboard Tab
         with gr.Tab("📊 Leaderboard"):
-            gr.Markdown("*All statistics are based on reviews from the last 6 months*")
+            gr.Markdown("*All statistics are based on reviews from the last month*")
             leaderboard_table = Leaderboard(
-                value=get_leaderboard_dataframe(),
+                value=pd.DataFrame(columns=[col[0] for col in LEADERBOARD_COLUMNS]),  # Empty initially
                 datatype=LEADERBOARD_COLUMNS,
                 search_columns=["Agent Name", "Website"],
                 filter_columns=["Acceptance Rate (%)"]
             )
 
-            gr.Markdown("### Monthly Metrics")
-            gr.Markdown("Track acceptance rates and review activity over time")
-
-            monthly_plot = gr.Plot(
-                value=create_monthly_metrics_plot(),
-                label="Monthly Review Metrics"
+            # Load leaderboard data when app starts
+            app.load(
+                fn=get_leaderboard_dataframe,
+                inputs=[],
+                outputs=[leaderboard_table]
             )
+
+            # Monthly Metrics Section
+            gr.Markdown("---")  # Divider
+            gr.Markdown("### 📈 Monthly Performance - Top 5 Agents")
+            gr.Markdown("*Shows acceptance rate trends and review volumes for the most active agents*")
+
+            monthly_metrics_plot = gr.Plot(label="Monthly Metrics")
+
+            # Load monthly metrics when app starts
+            app.load(
+                fn=lambda: create_monthly_metrics_plot(top_n=5),
+                inputs=[],
+                outputs=[monthly_metrics_plot]
+            )
+
 
         # Submit Agent Tab
         with gr.Tab("➕ Submit Agent"):
@@ -2507,7 +2537,7 @@ with gr.Blocks(title="SWE Agent Review Leaderboard", theme=gr.themes.Soft()) as 
             submit_button.click(
                 fn=submit_agent,
                 inputs=[github_input, name_input, organization_input, description_input, website_input],
-                outputs=[submission_status, leaderboard_table, monthly_plot]
+                outputs=[submission_status, leaderboard_table]
             )
 
 
