@@ -2000,7 +2000,7 @@ def get_leaderboard_dataframe():
     return df
 
 
-def submit_agent(identifier, agent_name, developer, description, website):
+def submit_agent(identifier, agent_name, developer, website):
     """
     Submit a new agent to the leaderboard.
     Validates input, saves submission, and fetches PR metadata (memory-efficient).
@@ -2019,7 +2019,6 @@ def submit_agent(identifier, agent_name, developer, description, website):
     identifier = identifier.strip()
     agent_name = agent_name.strip()
     developer = developer.strip()
-    description = description.strip()
     website = website.strip()
 
     # Validate GitHub identifier
@@ -2039,7 +2038,6 @@ def submit_agent(identifier, agent_name, developer, description, website):
         'agent_name': agent_name,
         'developer': developer,
         'github_identifier': identifier,
-        'description': description,
         'website': website,
     }
 
@@ -2252,11 +2250,6 @@ with gr.Blocks(title="SWE Agent Review Leaderboard", theme=gr.themes.Soft()) as 
                         label="Developer*",
                         placeholder="Your developer or team name"
                     )
-                    description_input = gr.Textbox(
-                        label="Description",
-                        placeholder="Brief description of your agent",
-                        lines=3
-                    )
                     website_input = gr.Textbox(
                         label="Website",
                         placeholder="https://your-agent-website.com"
@@ -2274,7 +2267,7 @@ with gr.Blocks(title="SWE Agent Review Leaderboard", theme=gr.themes.Soft()) as 
             # Event handler
             submit_button.click(
                 fn=submit_agent,
-                inputs=[github_input, name_input, developer_input, description_input, website_input],
+                inputs=[github_input, name_input, developer_input, website_input],
                 outputs=[submission_status, leaderboard_table]
             )
 
