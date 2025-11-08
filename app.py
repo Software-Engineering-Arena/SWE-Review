@@ -1915,7 +1915,7 @@ def create_monthly_metrics_plot(top_n=None):
 def get_leaderboard_dataframe():
     """
     Construct leaderboard from review metadata and convert to pandas DataFrame for display.
-    Returns formatted DataFrame sorted by retention rate.
+    Returns formatted DataFrame sorted by total reviews.
     """
     # Construct leaderboard from metadata
     cache_dict = construct_leaderboard_from_metadata()
@@ -1961,9 +1961,9 @@ def get_leaderboard_dataframe():
         if col in df.columns:
             df[col] = pd.to_numeric(df[col], errors='coerce').fillna(0)
 
-    # Sort by Acceptance Rate (%) descending
-    if "Acceptance Rate (%)" in df.columns and not df.empty:
-        df = df.sort_values(by="Acceptance Rate (%)", ascending=False).reset_index(drop=True)
+    # Sort by Total Reviews descending
+    if "Total Reviews" in df.columns and not df.empty:
+        df = df.sort_values(by="Total Reviews", ascending=False).reset_index(drop=True)
 
     print(f"✅ Final DataFrame shape: {df.shape}")
     print("="*60 + "\n")
