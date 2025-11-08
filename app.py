@@ -28,7 +28,7 @@ load_dotenv()
 
 AGENTS_REPO = "SWE-Arena/swe_agents"  # HuggingFace dataset for agent metadata
 REVIEW_METADATA_REPO = "SWE-Arena/review_metadata"  # HuggingFace dataset for review metadata
-LEADERBOARD_REPO = "SWE-Arena/swe_leaderboard"  # HuggingFace dataset for leaderboard data
+LEADERBOARD_REPO = "SWE-Arena/swe_leaderboards"  # HuggingFace dataset for leaderboard data
 LEADERBOARD_TIME_FRAME_DAYS = 180  # Time frame for constructing leaderboard
 UPDATE_TIME_FRAME_DAYS = 30  # Time frame for mining new reviews
 
