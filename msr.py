@@ -9,8 +9,10 @@ import tempfile
 from datetime import datetime, timezone, timedelta
 from collections import defaultdict
 from huggingface_hub import HfApi, hf_hub_download
+from huggingface_hub.errors import HfHubHTTPError
 from dotenv import load_dotenv
 from google.cloud import bigquery
+import backoff
 
 # Load environment variables
 load_dotenv()
@@ -93,6 +95,73 @@ def get_hf_token():
     if not token:
         print("Warning: HF_TOKEN not found in environment variables")
     return token
+
+
+# =============================================================================
+# HUGGINGFACE API WRAPPERS WITH BACKOFF
+# =============================================================================
+
+def is_rate_limit_error(e):
+    """Check if exception is a HuggingFace rate limit error (429)."""
+    if isinstance(e, HfHubHTTPError):
+        return e.response.status_code == 429
+    return False
+
+
+@backoff.on_exception(
+    backoff.expo,
+    HfHubHTTPError,
+    max_tries=8,
+    giveup=lambda e: not is_rate_limit_error(e),
+    on_backoff=lambda details: print(
+        f"⏳ Rate limited. Retrying in {details['wait']:.1f}s (attempt {details['tries']}/8)..."
+    )
+)
+def upload_large_folder_with_backoff(api, **kwargs):
+    """Wrapper for api.upload_large_folder() with exponential backoff for rate limits."""
+    return api.upload_large_folder(**kwargs)
+
+
+@backoff.on_exception(
+    backoff.expo,
+    HfHubHTTPError,
+    max_tries=8,
+    giveup=lambda e: not is_rate_limit_error(e),
+    on_backoff=lambda details: print(
+        f"⏳ Rate limited. Retrying in {details['wait']:.1f}s (attempt {details['tries']}/8)..."
+    )
+)
+def list_repo_files_with_backoff(api, **kwargs):
+    """Wrapper for api.list_repo_files() with exponential backoff for rate limits."""
+    return api.list_repo_files(**kwargs)
+
+
+@backoff.on_exception(
+    backoff.expo,
+    HfHubHTTPError,
+    max_tries=8,
+    giveup=lambda e: not is_rate_limit_error(e),
+    on_backoff=lambda details: print(
+        f"⏳ Rate limited. Retrying in {details['wait']:.1f}s (attempt {details['tries']}/8)..."
+    )
+)
+def hf_hub_download_with_backoff(**kwargs):
+    """Wrapper for hf_hub_download() with exponential backoff for rate limits."""
+    return hf_hub_download(**kwargs)
+
+
+@backoff.on_exception(
+    backoff.expo,
+    HfHubHTTPError,
+    max_tries=8,
+    giveup=lambda e: not is_rate_limit_error(e),
+    on_backoff=lambda details: print(
+        f"⏳ Rate limited. Retrying in {details['wait']:.1f}s (attempt {details['tries']}/8)..."
+    )
+)
+def upload_file_with_backoff(api, **kwargs):
+    """Wrapper for api.upload_file() with exponential backoff for rate limits."""
+    return api.upload_file(**kwargs)
 
 
 def get_bigquery_client():
@@ -490,7 +559,8 @@ def save_review_metadata_to_hf(metadata_list, agent_identifier):
             # Upload entire folder using upload_large_folder (optimized for large files)
             # Note: upload_large_folder creates multiple commits automatically and doesn't support custom commit_message
             print(f"   📤 Uploading {len(grouped)} files ({len(metadata_list)} total reviews)...")
-            api.upload_large_folder(
+            upload_large_folder_with_backoff(
+                api=api,
                 folder_path=temp_dir,
                 repo_id=REVIEW_METADATA_REPO,
                 repo_type="dataset"
@@ -522,7 +592,7 @@ def load_agents_from_hf():
         agents = []
 
         # List all files in the repository
-        files = api.list_repo_files(repo_id=AGENTS_REPO, repo_type="dataset")
+        files = list_repo_files_with_backoff(api=api, repo_id=AGENTS_REPO, repo_type="dataset")
 
         # Filter for JSON files only
         json_files = [f for f in files if f.endswith('.json')]
@@ -532,7 +602,7 @@ def load_agents_from_hf():
         # Download and parse each JSON file
         for json_file in json_files:
             try:
-                file_path = hf_hub_download(
+                file_path = hf_hub_download_with_backoff(
                     repo_id=AGENTS_REPO,
                     filename=json_file,
                     repo_type="dataset"
@@ -580,7 +650,7 @@ def load_review_metadata():
         token = get_hf_token()
 
         # List all files in the repository
-        files = api.list_repo_files(repo_id=REVIEW_METADATA_REPO, repo_type="dataset")
+        files = list_repo_files_with_backoff(api=api, repo_id=REVIEW_METADATA_REPO, repo_type="dataset")
 
         # Filter for JSONL files matching pattern: [agent_identifier]/YYYY.MM.DD.jsonl
         time_frame_files = []
@@ -616,7 +686,7 @@ def load_review_metadata():
 
                 agent_identifier = parts[0]
 
-                file_path = hf_hub_download(
+                file_path = hf_hub_download_with_backoff(
                     repo_id=REVIEW_METADATA_REPO,
                     filename=filename,
                     repo_type="dataset",
@@ -825,7 +895,7 @@ def construct_leaderboard_from_metadata():
         stats = calculate_review_stats_from_metadata(agent_metadata)
 
         cache_dict[identifier] = {
-            'agent_name': agent_name,
+            'name': agent_name,
             'name': agent_name,
             'website': agent.get('website', 'N/A'),
             'github_identifier': identifier,
@@ -872,7 +942,8 @@ def save_leaderboard_data_to_hf(leaderboard_dict, monthly_metrics):
 
         try:
             # Upload to HuggingFace
-            api.upload_file(
+            upload_file_with_backoff(
+                api=api,
                 path_or_fileobj=filename,
                 path_in_repo=filename,
                 repo_id=LEADERBOARD_REPO,
@@ -953,7 +1024,7 @@ def mine_all_agents():
     
     for i, agent in enumerate(agents, 1):
         identifier = agent.get('github_identifier')
-        agent_name = agent.get('name', agent.get('agent_name', 'Unknown'))
+        agent_name = agent.get('name', 'Unknown')
         
         if not identifier:
             print(f"[{i}/{len(agents)}] Skipping agent without identifier")

@@ -8,8 +8,10 @@ import requests
 from datetime import datetime, timezone, timedelta
 from collections import defaultdict
 from huggingface_hub import HfApi, hf_hub_download
+from huggingface_hub.errors import HfHubHTTPError
 from datasets import load_dataset, Dataset
 import threading
+import backoff
 from dotenv import load_dotenv
 import pandas as pd
 import random
@@ -103,6 +105,73 @@ def normalize_date_format(date_string):
     except Exception as e:
         print(f"Warning: Could not parse date '{date_string}': {e}")
         return date_string
+
+
+# =============================================================================
+# HUGGINGFACE API WRAPPERS WITH BACKOFF
+# =============================================================================
+
+def is_rate_limit_error(e):
+    """Check if exception is a HuggingFace rate limit error (429)."""
+    if isinstance(e, HfHubHTTPError):
+        return e.response.status_code == 429
+    return False
+
+
+@backoff.on_exception(
+    backoff.expo,
+    HfHubHTTPError,
+    max_tries=8,
+    giveup=lambda e: not is_rate_limit_error(e),
+    on_backoff=lambda details: print(
+        f"⏳ Rate limited. Retrying in {details['wait']:.1f}s (attempt {details['tries']}/8)..."
+    )
+)
+def upload_large_folder_with_backoff(api, **kwargs):
+    """Wrapper for api.upload_large_folder() with exponential backoff for rate limits."""
+    return api.upload_large_folder(**kwargs)
+
+
+@backoff.on_exception(
+    backoff.expo,
+    HfHubHTTPError,
+    max_tries=8,
+    giveup=lambda e: not is_rate_limit_error(e),
+    on_backoff=lambda details: print(
+        f"⏳ Rate limited. Retrying in {details['wait']:.1f}s (attempt {details['tries']}/8)..."
+    )
+)
+def list_repo_files_with_backoff(api, **kwargs):
+    """Wrapper for api.list_repo_files() with exponential backoff for rate limits."""
+    return api.list_repo_files(**kwargs)
+
+
+@backoff.on_exception(
+    backoff.expo,
+    HfHubHTTPError,
+    max_tries=8,
+    giveup=lambda e: not is_rate_limit_error(e),
+    on_backoff=lambda details: print(
+        f"⏳ Rate limited. Retrying in {details['wait']:.1f}s (attempt {details['tries']}/8)..."
+    )
+)
+def hf_hub_download_with_backoff(**kwargs):
+    """Wrapper for hf_hub_download() with exponential backoff for rate limits."""
+    return hf_hub_download(**kwargs)
+
+
+@backoff.on_exception(
+    backoff.expo,
+    HfHubHTTPError,
+    max_tries=8,
+    giveup=lambda e: not is_rate_limit_error(e),
+    on_backoff=lambda details: print(
+        f"⏳ Rate limited. Retrying in {details['wait']:.1f}s (attempt {details['tries']}/8)..."
+    )
+)
+def upload_file_with_backoff(api, **kwargs):
+    """Wrapper for api.upload_file() with exponential backoff for rate limits."""
+    return api.upload_file(**kwargs)
 
 
 # =============================================================================
@@ -216,7 +285,7 @@ def fetch_reviews_from_bigquery(client, identifier, start_date, end_date):
     For querying multiple agents efficiently, use fetch_all_pr_metadata_batched() instead.
 
     Queries githubarchive.day.YYYYMMDD tables for PullRequestReviewEvent where
-    actor.login matches the agent identifier.
+    actor.login matches the agent identifier, and joins with PR status.
 
     Args:
         client: BigQuery client instance
@@ -225,37 +294,74 @@ def fetch_reviews_from_bigquery(client, identifier, start_date, end_date):
         end_date: End datetime (timezone-aware)
 
     Returns:
-        List of review event rows with PR information
+        List of review event rows with PR information including merged_at and closed_at
     """
     print(f"\n🔍 Querying BigQuery for reviews by {identifier}")
     print(f"   Time range: {start_date.strftime('%Y-%m-%d')} to {end_date.strftime('%Y-%m-%d')}")
 
     # Generate list of table names for each day in the range
-    table_refs = []
+    review_tables = []
     current_date = start_date
     while current_date < end_date:
-        table_name = f"githubarchive.day.{current_date.strftime('%Y%m%d')}"
-        table_refs.append(table_name)
+        table_name = f"`githubarchive.day.{current_date.strftime('%Y%m%d')}`"
+        review_tables.append(f"SELECT * FROM {table_name}")
         current_date += timedelta(days=1)
+    review_union = " UNION ALL ".join(review_tables)
 
-    # Build UNION ALL query for all daily tables
-    union_parts = []
-    for table_name in table_refs:
-        union_parts.append(f"""
+    # Generate status tables (lookback for PR status)
+    status_start = end_date - timedelta(days=LEADERBOARD_TIME_FRAME_DAYS)
+    status_tables = []
+    current_date = status_start
+    while current_date < end_date:
+        table_name = f"`githubarchive.day.{current_date.strftime('%Y%m%d')}`"
+        status_tables.append(f"SELECT * FROM {table_name}")
+        current_date += timedelta(days=1)
+    status_union = " UNION ALL ".join(status_tables)
+
+    # Build comprehensive query with CTEs for PR status
+    query = f"""
+    WITH review_events AS (
         SELECT
-            repo.name as repo_name,
-            actor.login as actor_login,
-            JSON_EXTRACT_SCALAR(payload, '$.pull_request.url') as url,
-            CAST(JSON_EXTRACT_SCALAR(payload, '$.pull_request.number') AS INT64) as pr_number,
-            JSON_EXTRACT_SCALAR(payload, '$.review.submitted_at') as reviewed_at,
+            JSON_EXTRACT_SCALAR(payload, '$.pull_request.html_url') as url,
+            COALESCE(
+                JSON_EXTRACT_SCALAR(payload, '$.review.submitted_at'),
+                CAST(created_at AS STRING)
+            ) as reviewed_at,
+            actor.login as reviewer,
             created_at
-        FROM `{table_name}`
+        FROM (
+            {review_union}
+        )
         WHERE type = 'PullRequestReviewEvent'
         AND actor.login = @identifier
-        AND JSON_EXTRACT_SCALAR(payload, '$.pull_request.url') IS NOT NULL
-        """)
-
-    query = " UNION ALL ".join(union_parts)
+        AND JSON_EXTRACT_SCALAR(payload, '$.pull_request.html_url') IS NOT NULL
+    ),
+    pr_status AS (
+        SELECT
+            JSON_EXTRACT_SCALAR(payload, '$.pull_request.html_url') as url,
+            JSON_EXTRACT_SCALAR(payload, '$.pull_request.merged_at') as merged_at,
+            JSON_EXTRACT_SCALAR(payload, '$.pull_request.closed_at') as closed_at,
+            created_at
+        FROM (
+            {status_union}
+        )
+        WHERE type = 'PullRequestEvent'
+        AND JSON_EXTRACT_SCALAR(payload, '$.action') = 'closed'
+        AND JSON_EXTRACT_SCALAR(payload, '$.pull_request.html_url') IN (
+            SELECT DISTINCT url FROM review_events
+        )
+        QUALIFY ROW_NUMBER() OVER (PARTITION BY url ORDER BY created_at DESC) = 1
+    )
+    SELECT DISTINCT
+        re.url,
+        re.reviewed_at,
+        re.created_at,
+        ps.merged_at,
+        ps.closed_at
+    FROM review_events re
+    LEFT JOIN pr_status ps ON re.url = ps.url
+    ORDER BY re.reviewed_at DESC
+    """
 
     job_config = bigquery.QueryJobConfig(
         query_parameters=[
@@ -263,7 +369,7 @@ def fetch_reviews_from_bigquery(client, identifier, start_date, end_date):
         ]
     )
 
-    print(f"   Querying {len(table_refs)} daily tables...")
+    print(f"   Querying {len(review_tables)} review tables and {len(status_tables)} status tables...")
 
     try:
         query_job = client.query(query, job_config=job_config)
@@ -1233,7 +1339,8 @@ def save_review_metadata_to_hf(metadata_list, agent_identifier):
             # Upload entire folder using upload_large_folder (optimized for large files)
             # Note: upload_large_folder creates multiple commits automatically and doesn't support custom commit_message
             print(f"📤 Uploading {len(grouped)} files...")
-            api.upload_large_folder(
+            upload_large_folder_with_backoff(
+                api=api,
                 folder_path=temp_dir,
                 repo_id=REVIEW_METADATA_REPO,
                 repo_type="dataset"
@@ -1273,7 +1380,7 @@ def load_review_metadata():
         token = get_hf_token()
 
         # List all files in the repository
-        files = api.list_repo_files(repo_id=REVIEW_METADATA_REPO, repo_type="dataset")
+        files = list_repo_files_with_backoff(api=api, repo_id=REVIEW_METADATA_REPO, repo_type="dataset")
 
         # Filter for files matching the pattern: [agent_identifier]/YYYY.MM.DD.jsonl
         # AND within the time frame (parse date from filename)
@@ -1315,7 +1422,7 @@ def load_review_metadata():
                 agent_identifier = parts[0]
                 agent_identifiers_found.add(agent_identifier)
 
-                file_path = hf_hub_download(
+                file_path = hf_hub_download_with_backoff(
                     repo_id=REVIEW_METADATA_REPO,
                     filename=filename,
                     repo_type="dataset",
@@ -1371,7 +1478,7 @@ def get_latest_review_date_for_agent(agent_identifier):
         token = get_hf_token()
 
         # List all files in the repository
-        files = api.list_repo_files(repo_id=REVIEW_METADATA_REPO, repo_type="dataset")
+        files = list_repo_files_with_backoff(api=api, repo_id=REVIEW_METADATA_REPO, repo_type="dataset")
 
         # Filter for files in this agent's folder
         # New structure: [agent_identifier]/YYYY.MM.DD.jsonl
@@ -1385,7 +1492,7 @@ def get_latest_review_date_for_agent(agent_identifier):
         latest_date = None
         for filename in agent_files:
             try:
-                file_path = hf_hub_download(
+                file_path = hf_hub_download_with_backoff(
                     repo_id=REVIEW_METADATA_REPO,
                     filename=filename,
                     repo_type="dataset",
@@ -1430,7 +1537,7 @@ def get_daily_files_last_time_frame(agent_identifier):
         cutoff_date = today - timedelta(days=LEADERBOARD_TIME_FRAME_DAYS)
 
         # List all files in the repository
-        files = api.list_repo_files(repo_id=REVIEW_METADATA_REPO, repo_type="dataset")
+        files = list_repo_files_with_backoff(api=api, repo_id=REVIEW_METADATA_REPO, repo_type="dataset")
 
         # Filter for files in this agent's folder
         agent_pattern = f"{agent_identifier}/"
@@ -1639,7 +1746,7 @@ def load_agents_from_hf():
         agents = []
 
         # List all files in the repository
-        files = api.list_repo_files(repo_id=AGENTS_REPO, repo_type="dataset")
+        files = list_repo_files_with_backoff(api=api, repo_id=AGENTS_REPO, repo_type="dataset")
 
         # Filter for JSON files only
         json_files = [f for f in files if f.endswith('.json')]
@@ -1647,7 +1754,7 @@ def load_agents_from_hf():
         # Download and parse each JSON file
         for json_file in json_files:
             try:
-                file_path = hf_hub_download(
+                file_path = hf_hub_download_with_backoff(
                     repo_id=AGENTS_REPO,
                     filename=json_file,
                     repo_type="dataset"
@@ -1655,6 +1762,11 @@ def load_agents_from_hf():
 
                 with open(file_path, 'r') as f:
                     agent_data = json.load(f)
+
+                    # Only process agents with status == "public"
+                    if agent_data.get('status') != 'public':
+                        print(f"Skipping {json_file}: status is not 'public'")
+                        continue
 
                     # Extract github_identifier from filename (e.g., "claude[bot].json" -> "claude[bot]")
                     filename_identifier = json_file.replace('.json', '')
@@ -1839,7 +1951,7 @@ def load_leaderboard_data_from_hf():
         filename = "swe-review.json"
 
         # Download file
-        file_path = hf_hub_download(
+        file_path = hf_hub_download_with_backoff(
             repo_id=LEADERBOARD_REPO,
             filename=filename,
             repo_type="dataset",
@@ -1910,7 +2022,8 @@ def save_leaderboard_and_metrics_to_hf():
 
         # Upload to HuggingFace (will overwrite if exists)
         print(f"\n🤗 Uploading to {LEADERBOARD_REPO}...")
-        api.upload_file(
+        upload_file_with_backoff(
+            api=api,
             path_or_fileobj=file_like_object,
             path_in_repo="swe-review.json",
             repo_id=LEADERBOARD_REPO,
@@ -2019,7 +2132,8 @@ def construct_leaderboard_from_metadata():
         stats = calculate_review_stats_from_metadata(agent_metadata)
 
         cache_dict[identifier] = {
-            'agent_name': agent_name,
+            'name': agent_name,
+            'name': agent_name,  # Store both for compatibility
             'website': agent.get('website', 'N/A'),
             'github_identifier': identifier,
             **stats
@@ -2232,7 +2346,7 @@ def get_leaderboard_dataframe():
 
         # Only include display-relevant fields
         rows.append([
-            data.get('agent_name', 'Unknown'),
+            data.get('name', 'Unknown'),
             data.get('website', 'N/A'),
             total_reviews,
             data.get('merged_prs', 0),
@@ -2297,7 +2411,7 @@ def submit_agent(identifier, agent_name, developer, website):
 
     # Create submission
     submission = {
-        'agent_name': agent_name,
+        'name': agent_name,
         'developer': developer,
         'github_identifier': identifier,
         'website': website,
