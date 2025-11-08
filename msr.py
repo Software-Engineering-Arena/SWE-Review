@@ -21,6 +21,7 @@ load_dotenv()
 
 AGENTS_REPO = "SWE-Arena/swe_agents"
 REVIEW_METADATA_REPO = "SWE-Arena/review_metadata"
+LEADERBOARD_REPO = "SWE-Arena/swe_leaderboard"  # HuggingFace dataset for leaderboard data
 LEADERBOARD_TIME_FRAME_DAYS = 180  # Time frame for leaderboard
 
 # =============================================================================
@@ -448,21 +449,21 @@ def save_review_metadata_to_hf(metadata_list, agent_identifier):
 def load_agents_from_hf():
     """
     Load all agent metadata JSON files from HuggingFace dataset.
-    
+
     The github_identifier is extracted from the filename (e.g., 'agent-name[bot].json' -> 'agent-name[bot]')
     """
     try:
         api = HfApi()
         agents = []
-        
+
         # List all files in the repository
         files = api.list_repo_files(repo_id=AGENTS_REPO, repo_type="dataset")
-        
+
         # Filter for JSON files only
         json_files = [f for f in files if f.endswith('.json')]
-        
+
         print(f"Found {len(json_files)} agent files in {AGENTS_REPO}")
-        
+
         # Download and parse each JSON file
         for json_file in json_files:
             try:
@@ -471,7 +472,7 @@ def load_agents_from_hf():
                     filename=json_file,
                     repo_type="dataset"
                 )
-                
+
                 with open(file_path, 'r') as f:
                     agent_data = json.load(f)
 
@@ -485,17 +486,345 @@ def load_agents_from_hf():
                     agent_data['github_identifier'] = github_identifier
 
                     agents.append(agent_data)
-            
+
             except Exception as e:
                 print(f"Warning: Could not load {json_file}: {str(e)}")
                 continue
-        
+
         print(f"✓ Loaded {len(agents)} agents from HuggingFace")
         return agents
-    
+
     except Exception as e:
         print(f"Could not load agents from HuggingFace: {str(e)}")
         return []
+
+
+def load_review_metadata():
+    """
+    Load all review metadata from HuggingFace dataset within LEADERBOARD_TIME_FRAME_DAYS.
+
+    Returns:
+        List of dictionaries with 'agent_identifier' added to each review metadata.
+    """
+    # Calculate cutoff date
+    current_time = datetime.now(timezone.utc)
+    cutoff_date = current_time - timedelta(days=LEADERBOARD_TIME_FRAME_DAYS)
+
+    try:
+        api = HfApi()
+        token = get_hf_token()
+
+        # List all files in the repository
+        files = api.list_repo_files(repo_id=REVIEW_METADATA_REPO, repo_type="dataset")
+
+        # Filter for JSONL files matching pattern: [agent_identifier]/YYYY.MM.DD.jsonl
+        time_frame_files = []
+        for f in files:
+            if f.endswith('.jsonl'):
+                parts = f.split('/')
+                if len(parts) == 2:
+                    filename = parts[1]
+                    # Parse date from filename: YYYY.MM.DD.jsonl
+                    try:
+                        date_part = filename.replace('.jsonl', '')
+                        date_components = date_part.split('.')
+                        if len(date_components) == 3:
+                            file_year, file_month, file_day = map(int, date_components)
+                            file_date = datetime(file_year, file_month, file_day, tzinfo=timezone.utc)
+
+                            # Only include files within time frame
+                            if file_date >= cutoff_date:
+                                time_frame_files.append(f)
+                    except Exception:
+                        continue
+
+        print(f"📥 Loading review metadata from last {LEADERBOARD_TIME_FRAME_DAYS} days ({len(time_frame_files)} daily files)...")
+
+        all_metadata = []
+
+        for filename in time_frame_files:
+            try:
+                # Extract agent_identifier from path
+                parts = filename.split('/')
+                if len(parts) != 2:
+                    continue
+
+                agent_identifier = parts[0]
+
+                file_path = hf_hub_download(
+                    repo_id=REVIEW_METADATA_REPO,
+                    filename=filename,
+                    repo_type="dataset",
+                    token=token
+                )
+                day_metadata = load_jsonl(file_path)
+
+                # Add agent_identifier to each review
+                for review_meta in day_metadata:
+                    review_meta['agent_identifier'] = agent_identifier
+                    all_metadata.append(review_meta)
+
+            except Exception as e:
+                print(f"   Warning: Could not load {filename}: {str(e)}")
+
+        print(f"✓ Loaded {len(all_metadata)} total reviews from last {LEADERBOARD_TIME_FRAME_DAYS} days")
+        return all_metadata
+
+    except Exception as e:
+        print(f"✗ Error loading review metadata: {str(e)}")
+        return []
+
+
+def get_pr_status_from_metadata(review_meta):
+    """
+    Derive PR status from merged_at and closed_at fields.
+
+    Returns:
+        str: 'merged', 'closed', or 'open'
+    """
+    merged_at = review_meta.get('merged_at')
+    closed_at = review_meta.get('closed_at')
+
+    if merged_at:
+        return 'merged'
+    elif closed_at:
+        return 'closed'
+    else:
+        return 'open'
+
+
+def calculate_review_stats_from_metadata(metadata_list):
+    """
+    Calculate statistics from a list of review metadata.
+
+    Returns:
+        Dictionary with review metrics (total_reviews, merged_prs, acceptance_rate, etc.)
+    """
+    total_reviews = len(metadata_list)
+
+    # Count merged PRs
+    merged_prs = sum(1 for review_meta in metadata_list
+                      if get_pr_status_from_metadata(review_meta) == 'merged')
+
+    # Count rejected PRs
+    rejected_prs = sum(1 for review_meta in metadata_list
+                      if get_pr_status_from_metadata(review_meta) == 'closed')
+
+    # Count pending PRs
+    pending_prs = sum(1 for review_meta in metadata_list
+                     if get_pr_status_from_metadata(review_meta) == 'open')
+
+    # Calculate acceptance rate (exclude pending PRs)
+    completed_prs = merged_prs + rejected_prs
+    acceptance_rate = (merged_prs / completed_prs * 100) if completed_prs > 0 else 0
+
+    return {
+        'total_reviews': total_reviews,
+        'merged_prs': merged_prs,
+        'pending_prs': pending_prs,
+        'acceptance_rate': round(acceptance_rate, 2),
+    }
+
+
+def calculate_monthly_metrics_by_agent():
+    """
+    Calculate monthly metrics for all agents for visualization.
+
+    Returns:
+        dict: {
+            'agents': list of agent names,
+            'months': list of month labels (e.g., '2025-01'),
+            'data': {
+                agent_name: {
+                    'acceptance_rates': list of acceptance rates by month,
+                    'total_reviews': list of review counts by month,
+                    'merged_prs': list of merged PR counts by month,
+                }
+            }
+        }
+    """
+    # Load agents
+    agents = load_agents_from_hf()
+
+    # Create mapping from agent_identifier to agent_name
+    identifier_to_name = {agent.get('github_identifier'): agent.get('name') for agent in agents if agent.get('github_identifier')}
+
+    # Load all review metadata
+    all_metadata = load_review_metadata()
+
+    if not all_metadata:
+        return {'agents': [], 'months': [], 'data': {}}
+
+    # Group by agent and month
+    agent_month_data = defaultdict(lambda: defaultdict(list))
+
+    for review_meta in all_metadata:
+        agent_identifier = review_meta.get('agent_identifier')
+        reviewed_at = review_meta.get('reviewed_at')
+
+        if not agent_identifier or not reviewed_at:
+            continue
+
+        # Get agent_name from identifier
+        agent_name = identifier_to_name.get(agent_identifier, agent_identifier)
+
+        try:
+            dt = datetime.fromisoformat(reviewed_at.replace('Z', '+00:00'))
+            month_key = f"{dt.year}-{dt.month:02d}"
+            agent_month_data[agent_name][month_key].append(review_meta)
+        except Exception as e:
+            print(f"Warning: Could not parse date '{reviewed_at}': {e}")
+            continue
+
+    # Get all unique months and sort them
+    all_months = set()
+    for agent_data in agent_month_data.values():
+        all_months.update(agent_data.keys())
+    months = sorted(list(all_months))
+
+    # Calculate metrics for each agent and month
+    result_data = {}
+    for agent_name, month_dict in agent_month_data.items():
+        acceptance_rates = []
+        total_reviews_list = []
+        merged_prs_list = []
+
+        for month in months:
+            reviews_in_month = month_dict.get(month, [])
+
+            # Count merged PRs
+            merged_count = sum(1 for review in reviews_in_month
+                                if get_pr_status_from_metadata(review) == 'merged')
+
+            # Count rejected PRs
+            rejected_count = sum(1 for review in reviews_in_month
+                                if get_pr_status_from_metadata(review) == 'closed')
+
+            # Total reviews
+            total_count = len(reviews_in_month)
+
+            # Calculate acceptance rate (exclude pending PRs)
+            completed_count = merged_count + rejected_count
+            acceptance_rate = (merged_count / completed_count * 100) if completed_count > 0 else None
+
+            acceptance_rates.append(acceptance_rate)
+            total_reviews_list.append(total_count)
+            merged_prs_list.append(merged_count)
+
+        result_data[agent_name] = {
+            'acceptance_rates': acceptance_rates,
+            'total_reviews': total_reviews_list,
+            'merged_prs': merged_prs_list,
+        }
+
+    agents_list = sorted(list(agent_month_data.keys()))
+
+    return {
+        'agents': agents_list,
+        'months': months,
+        'data': result_data
+    }
+
+
+def construct_leaderboard_from_metadata():
+    """
+    Construct leaderboard from stored review metadata.
+
+    Returns:
+        Dictionary of agent stats.
+    """
+    print("\n📊 Constructing leaderboard from review metadata...")
+
+    # Load agents
+    agents = load_agents_from_hf()
+    if not agents:
+        print("⚠️ No agents found")
+        return {}
+
+    print(f"✓ Loaded {len(agents)} agents")
+
+    # Load all review metadata
+    all_metadata = load_review_metadata()
+    print(f"✓ Loaded {len(all_metadata)} review metadata entries")
+
+    cache_dict = {}
+
+    for agent in agents:
+        identifier = agent.get('github_identifier')
+        agent_name = agent.get('name', 'Unknown')
+
+        # Filter metadata for this agent
+        agent_metadata = [review for review in all_metadata if review.get("agent_identifier") == identifier]
+
+        # Calculate stats
+        stats = calculate_review_stats_from_metadata(agent_metadata)
+
+        cache_dict[identifier] = {
+            'agent_name': agent_name,
+            'name': agent_name,
+            'website': agent.get('website', 'N/A'),
+            'github_identifier': identifier,
+            **stats
+        }
+
+    print(f"✓ Constructed cache with {len(cache_dict)} agent entries")
+
+    return cache_dict
+
+
+def save_leaderboard_data_to_hf(leaderboard_dict, monthly_metrics):
+    """
+    Save leaderboard data and monthly metrics to HuggingFace dataset as swe-review.json.
+
+    Args:
+        leaderboard_dict: Dictionary of agent stats from construct_leaderboard_from_metadata()
+        monthly_metrics: Monthly metrics data from calculate_monthly_metrics_by_agent()
+
+    Returns:
+        bool: True if successful, False otherwise
+    """
+    try:
+        token = get_hf_token()
+        if not token:
+            raise Exception("No HuggingFace token found")
+
+        api = HfApi(token=token)
+        filename = "swe-review.json"
+
+        # Combine leaderboard and monthly metrics
+        combined_data = {
+            'last_updated': datetime.now(timezone.utc).isoformat(),
+            'leaderboard': leaderboard_dict,
+            'monthly_metrics': monthly_metrics,
+            'metadata': {
+                'leaderboard_time_frame_days': LEADERBOARD_TIME_FRAME_DAYS
+            }
+        }
+
+        # Save locally first
+        with open(filename, 'w') as f:
+            json.dump(combined_data, f, indent=2)
+
+        try:
+            # Upload to HuggingFace
+            api.upload_file(
+                path_or_fileobj=filename,
+                path_in_repo=filename,
+                repo_id=LEADERBOARD_REPO,
+                repo_type="dataset"
+            )
+            print(f"✓ Saved leaderboard data to HuggingFace: {filename}")
+            return True
+        finally:
+            # Always clean up local file
+            if os.path.exists(filename):
+                os.remove(filename)
+
+    except Exception as e:
+        print(f"✗ Error saving leaderboard data: {str(e)}")
+        import traceback
+        traceback.print_exc()
+        return False
 
 
 # =============================================================================
@@ -595,6 +924,35 @@ def mine_all_agents():
     print(f"   Errors: {error_count}")
     print(f"   BigQuery queries executed: 1")
     print(f"{'='*80}\n")
+
+    # Construct and save leaderboard data
+    print(f"\n{'='*80}")
+    print(f"📊 Constructing and saving leaderboard data...")
+    print(f"{'='*80}\n")
+
+    try:
+        # Construct leaderboard
+        leaderboard_dict = construct_leaderboard_from_metadata()
+
+        # Calculate monthly metrics
+        print(f"\n📈 Calculating monthly metrics...")
+        monthly_metrics = calculate_monthly_metrics_by_agent()
+
+        # Save to HuggingFace
+        print(f"\n💾 Saving leaderboard data to HuggingFace...")
+        save_leaderboard_data_to_hf(leaderboard_dict, monthly_metrics)
+
+        print(f"\n{'='*80}")
+        print(f"✅ Leaderboard data saved successfully!")
+        print(f"   Leaderboard entries: {len(leaderboard_dict)}")
+        print(f"   Monthly data points: {len(monthly_metrics.get('months', []))} months")
+        print(f"   Saved to: {LEADERBOARD_REPO}/swe-review.json")
+        print(f"{'='*80}\n")
+
+    except Exception as e:
+        print(f"\n✗ Failed to construct/save leaderboard data: {str(e)}")
+        import traceback
+        traceback.print_exc()
 
 
 # =============================================================================
