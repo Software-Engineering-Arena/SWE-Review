@@ -2157,7 +2157,7 @@ with gr.Blocks(title="SWE Agent Review Leaderboard", theme=gr.themes.Soft()) as 
     total_months = LEADERBOARD_TIME_FRAME_DAYS // 30
 
     gr.Markdown("# 🏆 SWE Agent Review Leaderboard")
-    gr.Markdown(f"Track and compare GitHub PR review acceptance statistics for SWE agents (last {total_months} months)")
+    gr.Markdown(f"Track and compare GitHub PR review acceptance statistics for SWE agents")
     
     with gr.Tabs():
 
