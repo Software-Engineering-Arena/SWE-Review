@@ -51,6 +51,41 @@ def save_jsonl(filename, data):
             f.write(json.dumps(item) + '\n')
 
 
+def normalize_date_format(date_string):
+    """
+    Convert date strings to standardized ISO 8601 format with Z suffix.
+    Handles both 'T' and space-separated datetime formats (including newlines).
+    Examples:
+    - 2025-10-15T23:23:47.983068 -> 2025-10-15T23:23:47Z
+    - 2025-06-17 21:21:07+00 -> 2025-06-17T21:21:07Z
+    """
+    if not date_string or date_string == 'N/A':
+        return 'N/A'
+
+    try:
+        import re
+        # Remove all whitespace (spaces, newlines, tabs) and replace with single space
+        date_string = re.sub(r'\s+', ' ', date_string.strip())
+
+        # Replace space with 'T' for ISO format compatibility
+        date_string = date_string.replace(' ', 'T')
+
+        # Fix incomplete timezone offset (+00 or -00 -> +00:00 or -00:00)
+        # Check if timezone offset exists and is incomplete
+        if len(date_string) >= 3:
+            if date_string[-3:-2] in ('+', '-') and ':' not in date_string[-3:]:
+                date_string = date_string + ':00'
+
+        # Parse the date string (handles both with and without microseconds)
+        dt = datetime.fromisoformat(date_string.replace('Z', '+00:00'))
+
+        # Convert to standardized format
+        return dt.strftime('%Y-%m-%dT%H:%M:%SZ')
+    except Exception as e:
+        print(f"Warning: Could not parse date '{date_string}': {e}")
+        return date_string
+
+
 def get_hf_token():
     """Get HuggingFace token from environment variables."""
     token = os.getenv('HF_TOKEN')
@@ -267,20 +302,23 @@ def fetch_all_pr_metadata_single_query(client, identifiers, start_date, end_date
         
         for row in results:
             reviewer = row.reviewer
-            
-            # Convert datetime objects to ISO strings
+
+            # Convert datetime objects to ISO strings and normalize
             reviewed_at = row.reviewed_at
             if hasattr(reviewed_at, 'isoformat'):
                 reviewed_at = reviewed_at.isoformat()
-                
+            reviewed_at = normalize_date_format(reviewed_at) if reviewed_at else None
+
             merged_at = row.merged_at
             if hasattr(merged_at, 'isoformat'):
                 merged_at = merged_at.isoformat()
-                
+            merged_at = normalize_date_format(merged_at) if merged_at else None
+
             closed_at = row.closed_at
             if hasattr(closed_at, 'isoformat'):
                 closed_at = closed_at.isoformat()
-            
+            closed_at = normalize_date_format(closed_at) if closed_at else None
+
             metadata_by_agent[reviewer].append({
                 'url': row.url,
                 'reviewed_at': reviewed_at,

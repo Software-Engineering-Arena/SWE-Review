@@ -223,13 +223,18 @@ def extract_review_metadata_from_bigquery(review_row):
     merged_at = getattr(review_row, 'merged_at', None)
     closed_at = getattr(review_row, 'closed_at', None)
 
-    # Convert to ISO format if datetime
+    # Convert to ISO format if datetime and normalize
     if hasattr(reviewed_at, 'isoformat'):
         reviewed_at = reviewed_at.isoformat()
+    reviewed_at = normalize_date_format(reviewed_at) if reviewed_at else None
+
     if merged_at and hasattr(merged_at, 'isoformat'):
         merged_at = merged_at.isoformat()
+    merged_at = normalize_date_format(merged_at) if merged_at else None
+
     if closed_at and hasattr(closed_at, 'isoformat'):
         closed_at = closed_at.isoformat()
+    closed_at = normalize_date_format(closed_at) if closed_at else None
 
     return {
         'url': url,
