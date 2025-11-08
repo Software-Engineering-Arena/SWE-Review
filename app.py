@@ -1266,13 +1266,6 @@ def load_review_metadata():
 
         print(f"✓ Loaded {len(all_metadata)} total reviews from last {LEADERBOARD_TIME_FRAME_DAYS} days")
 
-        # DEBUG: Show unique agent identifiers found in review folders
-        if agent_identifiers_found:
-            print(f"📋 Agent identifiers found in review metadata folders:")
-            for identifier in sorted(agent_identifiers_found):
-                count = sum(1 for r in all_metadata if r.get('agent_identifier') == identifier)
-                print(f"   - '{identifier}': {count} reviews")
-
         return all_metadata
 
     except Exception as e:
@@ -1591,9 +1584,6 @@ def load_agents_from_hf():
                     # Add or override github_identifier to match filename
                     agent_data['github_identifier'] = filename_identifier
 
-                    # DEBUG: Log the identifier being used
-                    print(f"   ✓ Loaded agent: '{filename_identifier}' -> {agent_data.get('name', 'Unknown')}")
-
                     agents.append(agent_data)
 
             except Exception as e:
@@ -1763,13 +1753,6 @@ def construct_leaderboard_from_metadata():
     all_metadata = load_review_metadata()
     print(f"✓ Loaded {len(all_metadata)} review metadata entries")
 
-    # Debug: Check what agent_identifiers exist in review metadata
-    if all_metadata:
-        review_identifiers = set(r.get('agent_identifier') for r in all_metadata if r.get('agent_identifier'))
-        print(f"   Unique agent_identifiers in reviews: {review_identifiers}")
-    else:
-        print("⚠️ No review metadata loaded!")
-
     cache_dict = {}
 
     for agent in agents:
@@ -1778,10 +1761,6 @@ def construct_leaderboard_from_metadata():
 
         # Filter metadata for this agent
         agent_metadata = [review for review in all_metadata if review.get("agent_identifier") == identifier]
-
-        # Debug output
-        if len(agent_metadata) > 0:
-            print(f"   ✓ Agent '{identifier}' matched {len(agent_metadata)} reviews")
 
         # Calculate stats
         stats = calculate_review_stats_from_metadata(agent_metadata)
@@ -1938,10 +1917,6 @@ def get_leaderboard_dataframe():
     Construct leaderboard from review metadata and convert to pandas DataFrame for display.
     Returns formatted DataFrame sorted by retention rate.
     """
-    print("\n" + "="*60)
-    print("🔍 DEBUG: get_leaderboard_dataframe() called")
-    print("="*60)
-
     # Construct leaderboard from metadata
     cache_dict = construct_leaderboard_from_metadata()
 
