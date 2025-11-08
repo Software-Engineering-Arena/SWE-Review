@@ -85,16 +85,18 @@ def normalize_date_format(date_string):
     """
     if not date_string or date_string == 'N/A':
         return 'N/A'
-    
+
     try:
+        # Replace space with 'T' for ISO format compatibility
+        date_string = date_string.replace(' ', 'T')
+
+        # Fix incomplete timezone offset (+00 or -00 -> +00:00 or -00:00)
+        if date_string[-3:-2] in ('+', '-') and ':' not in date_string[-3:]:
+            date_string = date_string + ':00'
+
         # Parse the date string (handles both with and without microseconds)
-        if '.' in date_string:
-            # Old format with microseconds
-            dt = datetime.fromisoformat(date_string.replace('Z', '+00:00'))
-        else:
-            # Already in correct format or GitHub format
-            return date_string
-        
+        dt = datetime.fromisoformat(date_string.replace('Z', '+00:00'))
+
         # Convert to standardized format
         return dt.strftime('%Y-%m-%dT%H:%M:%SZ')
     except Exception as e:
