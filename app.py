@@ -1564,8 +1564,6 @@ def load_agents_from_hf():
         # Filter for JSON files only
         json_files = [f for f in files if f.endswith('.json')]
 
-        print(f"Found {len(json_files)} agent files in {AGENTS_REPO}")
-
         # Download and parse each JSON file
         for json_file in json_files:
             try:
@@ -2148,7 +2146,11 @@ scheduler.add_job(
     replace_existing=True
 )
 scheduler.start()
-print(f"✓ Scheduler started: Incremental Update at 12:00 AM UTC every Monday (updates existing metadata + mines last {UPDATE_TIME_FRAME_DAYS} days of reviews)")
+print(f"\n{'='*80}")
+print(f"✓ Scheduler initialized successfully")
+print(f"⛏️  Mining schedule: Every Monday at 12:00 AM UTC")
+print(f"📥 On startup: Only loads cached data from HuggingFace (no mining)")
+print(f"{'='*80}\n")
 
 # Create Gradio interface
 with gr.Blocks(title="SWE Agent Review Leaderboard", theme=gr.themes.Soft()) as app:
