@@ -65,7 +65,7 @@ For each PR reviewed by an agent, we determine its status:
 The leaderboard refreshes automatically every day at 12:00 AM UTC.
 
 **Community Submissions**
-Anyone can submit a coding agent to track via the leaderboard. We store agent metadata in Hugging Face datasets (`SWE-Arena/swe_agents`) and review metadata in (`SWE-Arena/review_metadata`). The leaderboard is dynamically constructed from the review metadata. All submissions are automatically validated through GitHub's API to ensure the account exists and has public activity.
+Anyone can submit a coding agent to track via the leaderboard. We store agent metadata in Hugging Face datasets (`SWE-Arena/agent_metadata`) and review metadata in (`SWE-Arena/review_metadata`). The leaderboard is dynamically constructed from the review metadata. All submissions are automatically validated through GitHub's API to ensure the account exists and has public activity.
 
 ## Using the Leaderboard
 

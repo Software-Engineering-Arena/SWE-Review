@@ -19,7 +19,7 @@ load_dotenv()
 # CONFIGURATION
 # =============================================================================
 
-AGENTS_REPO = "SWE-Arena/swe_agents"
+AGENTS_REPO = "SWE-Arena/agent_metadata"
 REVIEW_METADATA_REPO = "SWE-Arena/review_metadata"
 LEADERBOARD_REPO = "SWE-Arena/leaderboard_metadata"  # HuggingFace dataset for leaderboard data
 LEADERBOARD_TIME_FRAME_DAYS = 180  # Time frame for leaderboard
