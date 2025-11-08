@@ -1788,6 +1788,77 @@ def load_leaderboard_data_from_hf():
         return None
 
 
+def save_leaderboard_and_metrics_to_hf():
+    """
+    Save leaderboard data and monthly metrics to SWE-Arena/leaderboard_metadata dataset.
+    Creates a comprehensive JSON file with both leaderboard stats and monthly metrics.
+    If the file exists, it will be overwritten.
+
+    Returns:
+        bool: True if successful, False otherwise
+    """
+    import io
+
+    try:
+        token = get_hf_token()
+        if not token:
+            raise Exception("No HuggingFace token found")
+
+        api = HfApi(token=token)
+
+        print(f"\n{'='*80}")
+        print(f"📊 Preparing leaderboard and metrics data for upload...")
+        print(f"{'='*80}\n")
+
+        # Get leaderboard data from review metadata
+        print("   Constructing leaderboard data from review metadata...")
+        leaderboard_data = construct_leaderboard_from_metadata()
+
+        # Get monthly metrics data (all agents, not just top N)
+        print("   Calculating monthly metrics from review metadata...")
+        monthly_metrics = calculate_monthly_metrics_by_agent(top_n=None)
+
+        # Combine into a single structure
+        combined_data = {
+            "leaderboard": leaderboard_data,
+            "monthly_metrics": monthly_metrics,
+            "metadata": {
+                "last_updated": datetime.now(timezone.utc).isoformat(),
+                "time_frame_days": LEADERBOARD_TIME_FRAME_DAYS,
+                "total_agents": len(leaderboard_data)
+            }
+        }
+
+        print(f"   Leaderboard entries: {len(leaderboard_data)}")
+        print(f"   Monthly metrics for: {len(monthly_metrics['agents'])} agents")
+        print(f"   Time frame: {LEADERBOARD_TIME_FRAME_DAYS} days")
+
+        # Convert to JSON and create file-like object
+        json_content = json.dumps(combined_data, indent=2)
+        file_like_object = io.BytesIO(json_content.encode('utf-8'))
+
+        # Upload to HuggingFace (will overwrite if exists)
+        print(f"\n🤗 Uploading to {LEADERBOARD_REPO}...")
+        api.upload_file(
+            path_or_fileobj=file_like_object,
+            path_in_repo="swe-review.json",
+            repo_id=LEADERBOARD_REPO,
+            repo_type="dataset",
+            token=token,
+            commit_message=f"Update leaderboard data - {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S')} UTC"
+        )
+
+        print(f"   ✓ Successfully uploaded swe-review.json")
+        print(f"{'='*80}\n")
+
+        return True
+
+    except Exception as e:
+        print(f"✗ Error saving leaderboard and metrics: {str(e)}")
+        import traceback
+        traceback.print_exc()
+        return False
+
 
 
 # =============================================================================
@@ -1813,23 +1884,24 @@ def update_all_agents_incremental():
         # Fetch and update reviews
         fetch_and_update_weekly_reviews()
 
-        # Reload statistics from updated metadata
-        print(f"\n📋 Constructing leaderboard from updated review metadata...")
-        leaderboard_dict = construct_leaderboard_from_metadata()
+        # After mining is complete, save leaderboard and metrics to HuggingFace
+        print(f"\n📤 Uploading leaderboard and metrics data...")
+        if save_leaderboard_and_metrics_to_hf():
+            print(f"✓ Leaderboard and metrics successfully uploaded to {LEADERBOARD_REPO}")
+        else:
+            print(f"⚠️ Failed to upload leaderboard and metrics data")
 
-        # Calculate monthly metrics
-        print(f"\n📈 Calculating monthly metrics...")
-        monthly_metrics = calculate_monthly_metrics_by_agent()
-
-        # Save to HuggingFace leaderboard dataset
-        print(f"\n💾 Saving leaderboard data to HuggingFace...")
-        save_leaderboard_data_to_hf(leaderboard_dict, monthly_metrics)
+        # Get the final count (reload from saved data)
+        saved_data = load_leaderboard_data_from_hf()
+        agent_count = 0
+        if saved_data and 'leaderboard' in saved_data:
+            agent_count = len(saved_data['leaderboard'])
 
         print(f"\n{'='*80}")
         print(f"📊 Update Summary:")
         print(f"   ✓ Updated existing review statuses")
         print(f"   ✓ Fetched new reviews from last {UPDATE_TIME_FRAME_DAYS} days")
-        print(f"   ✓ Leaderboard constructed with {len(leaderboard_dict)} agents")
+        print(f"   ✓ Leaderboard constructed with {agent_count} agents")
         print(f"   ✓ Monthly metrics calculated")
         print(f"   ✓ Data saved to {LEADERBOARD_REPO}")
         print(f"{'='*80}")
@@ -2313,16 +2385,11 @@ def initialize_leaderboard_data():
     else:
         print(f"⚠️ No saved leaderboard data found. Constructing from metadata...")
         try:
-            # Construct leaderboard
-            leaderboard_dict = construct_leaderboard_from_metadata()
-
-            # Calculate monthly metrics
-            monthly_metrics = calculate_monthly_metrics_by_agent()
-
-            # Save to HuggingFace
-            save_leaderboard_data_to_hf(leaderboard_dict, monthly_metrics)
-
-            print(f"✓ Initial leaderboard data created and saved")
+            # Save leaderboard and metrics to HuggingFace
+            if save_leaderboard_and_metrics_to_hf():
+                print(f"✓ Initial leaderboard data created and saved")
+            else:
+                print(f"⚠️ Failed to save initial leaderboard data")
         except Exception as e:
             print(f"✗ Failed to initialize leaderboard data: {str(e)}")
             import traceback
