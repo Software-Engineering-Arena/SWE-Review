@@ -139,9 +139,81 @@ def get_bigquery_client():
         raise ValueError("GOOGLE_APPLICATION_CREDENTIALS_JSON not found in environment")
 
 
+def fetch_all_pr_metadata_batched(client, identifiers, start_date, end_date, batch_size=100):
+    """
+    Fetch PR review metadata for ALL agents using BATCHED BigQuery queries.
+    Splits agents into smaller batches to avoid performance issues with large queries.
+
+    Args:
+        client: BigQuery client instance
+        identifiers: List of GitHub usernames/bot identifiers
+        start_date: Start datetime (timezone-aware)
+        end_date: End datetime (timezone-aware)
+        batch_size: Number of agents to process per batch (default: 100)
+
+    Returns:
+        Dictionary mapping agent identifier to list of PR metadata
+    """
+    print(f"\n🔍 Using BATCHED approach: {len(identifiers)} agents in batches of {batch_size}")
+
+    # Split identifiers into batches
+    batches = [identifiers[i:i + batch_size] for i in range(0, len(identifiers), batch_size)]
+    total_batches = len(batches)
+
+    print(f"   Total batches: {total_batches}")
+
+    # Collect results from all batches
+    all_metadata = {}
+    successful_batches = 0
+    failed_batches = 0
+
+    for batch_num, batch_identifiers in enumerate(batches, 1):
+        print(f"\n📦 Processing batch {batch_num}/{total_batches} ({len(batch_identifiers)} agents)...")
+
+        try:
+            # Query this batch - process each agent in the batch
+            for identifier in batch_identifiers:
+                review_rows = fetch_reviews_from_bigquery(client, identifier, start_date, end_date)
+
+                # Extract metadata
+                metadata_list = []
+                seen_prs = set()
+                for row in review_rows:
+                    url = row.url
+                    if url in seen_prs:
+                        continue
+                    seen_prs.add(url)
+
+                    metadata = extract_review_metadata_from_bigquery(row)
+                    metadata_list.append(metadata)
+
+                if metadata_list:
+                    all_metadata[identifier] = metadata_list
+
+            successful_batches += 1
+            print(f"   ✓ Batch {batch_num}/{total_batches} complete: {len(batch_identifiers)} agents processed")
+
+        except Exception as e:
+            failed_batches += 1
+            print(f"   ✗ Batch {batch_num}/{total_batches} failed: {str(e)}")
+            print(f"   Continuing with remaining batches...")
+            continue
+
+    print(f"\n📊 Batching Summary:")
+    print(f"   Total batches: {total_batches}")
+    print(f"   Successful: {successful_batches}")
+    print(f"   Failed: {failed_batches}")
+    print(f"   Total agents with data: {len(all_metadata)}")
+
+    return all_metadata
+
+
 def fetch_reviews_from_bigquery(client, identifier, start_date, end_date):
     """
-    Fetch PR review events from GitHub Archive for a specific agent.
+    Fetch PR review events from GitHub Archive for a SINGLE agent.
+
+    NOTE: This function is designed for querying a single agent at a time.
+    For querying multiple agents efficiently, use fetch_all_pr_metadata_batched() instead.
 
     Queries githubarchive.day.YYYYMMDD tables for PullRequestReviewEvent where
     actor.login matches the agent identifier.
