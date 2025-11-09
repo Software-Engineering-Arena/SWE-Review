@@ -222,7 +222,7 @@ def generate_table_union_statements(start_date, end_date):
 # BIGQUERY FUNCTIONS
 # =============================================================================
 
-def fetch_all_pr_metadata_batched(client, identifiers, start_date, end_date, batch_size=50):
+def fetch_all_pr_metadata_batched(client, identifiers, start_date, end_date, batch_size=50, upload_immediately=True):
     """
     Fetch PR review metadata for ALL agents using BATCHED BigQuery queries.
     Splits agents into smaller batches to avoid performance issues with large queries.
@@ -232,12 +232,19 @@ def fetch_all_pr_metadata_batched(client, identifiers, start_date, end_date, bat
         identifiers: List of GitHub usernames/bot identifiers
         start_date: Start datetime (timezone-aware)
         end_date: End datetime (timezone-aware)
-        batch_size: Number of agents to process per batch (default: 100)
+        batch_size: Number of agents to process per batch (default: 50)
+        upload_immediately: If True, upload each batch to HuggingFace immediately after processing (default: True)
 
     Returns:
         Dictionary mapping agent identifier to list of PR metadata (same format as single query)
     """
     print(f"\n🔍 Using BATCHED approach: {len(identifiers)} agents in batches of {batch_size}")
+
+    # Log upload mode
+    if upload_immediately:
+        print(f"   📤 Upload mode: IMMEDIATE (upload after each batch)")
+    else:
+        print(f"   📤 Upload mode: DEFERRED (upload after all batches complete)")
 
     # Split identifiers into batches
     batches = [identifiers[i:i + batch_size] for i in range(0, len(identifiers), batch_size)]
@@ -268,6 +275,21 @@ def fetch_all_pr_metadata_batched(client, identifiers, start_date, end_date, bat
 
             successful_batches += 1
             print(f"   ✓ Batch {batch_num}/{total_batches} complete: {len(batch_results)} agents processed")
+
+            # Upload immediately after this batch if enabled
+            if upload_immediately and batch_results:
+                print(f"\n   📤 Uploading batch {batch_num}/{total_batches} results to HuggingFace...")
+                upload_success = 0
+                upload_errors = 0
+
+                for identifier, metadata_list in batch_results.items():
+                    if metadata_list:
+                        if save_review_metadata_to_hf(metadata_list, identifier):
+                            upload_success += 1
+                        else:
+                            upload_errors += 1
+
+                print(f"   ✓ Batch {batch_num}/{total_batches} upload complete ({upload_success} agents uploaded, {upload_errors} errors)")
 
         except Exception as e:
             failed_batches += 1
@@ -1004,68 +1026,27 @@ def mine_all_agents():
     
     try:
         # Use batched approach for better performance
+        # upload_immediately=True means each batch uploads to HuggingFace right after BigQuery completes
         all_metadata = fetch_all_pr_metadata_batched(
-            client, identifiers, start_date, end_date, batch_size=50
+            client, identifiers, start_date, end_date, batch_size=50, upload_immediately=True
         )
+
+        # Calculate summary statistics
+        total_prs = sum(len(metadata_list) for metadata_list in all_metadata.values())
+        agents_with_data = sum(1 for metadata_list in all_metadata.values() if metadata_list)
+
+        print(f"\n{'='*80}")
+        print(f"✅ BigQuery mining and upload complete!")
+        print(f"   Total agents: {len(agents)}")
+        print(f"   Agents with data: {agents_with_data}")
+        print(f"   Total PRs found: {total_prs}")
+        print(f"{'='*80}\n")
+
     except Exception as e:
         print(f"✗ Error during BigQuery fetch: {str(e)}")
         import traceback
         traceback.print_exc()
         return
-    
-    # Save results for each agent
-    print(f"\n{'='*80}")
-    print(f"💾 Saving results to HuggingFace for each agent...")
-    print(f"{'='*80}\n")
-    
-    success_count = 0
-    error_count = 0
-    no_data_count = 0
-    
-    for i, agent in enumerate(agents, 1):
-        identifier = agent.get('github_identifier')
-        agent_name = agent.get('name', 'Unknown')
-        
-        if not identifier:
-            print(f"[{i}/{len(agents)}] Skipping agent without identifier")
-            error_count += 1
-            continue
-        
-        metadata = all_metadata.get(identifier, [])
-        
-        print(f"[{i}/{len(agents)}] {agent_name} ({identifier}):")
-        
-        try:
-            if metadata:
-                print(f"   💾 Saving {len(metadata)} review records...")
-                if save_review_metadata_to_hf(metadata, identifier):
-                    success_count += 1
-                else:
-                    error_count += 1
-            else:
-                print(f"   No reviews found")
-                no_data_count += 1
-        
-        except Exception as e:
-            print(f"   ✗ Error saving {identifier}: {str(e)}")
-            import traceback
-            traceback.print_exc()
-            error_count += 1
-            continue
-    
-    # Calculate number of batches
-    total_identifiers = len(identifiers)
-    batch_size = 50
-    num_batches = (total_identifiers + batch_size - 1) // batch_size  # Ceiling division
-
-    print(f"\n{'='*80}")
-    print(f"✅ Mining complete!")
-    print(f"   Total agents: {len(agents)}")
-    print(f"   Successfully saved: {success_count}")
-    print(f"   No data (skipped): {no_data_count}")
-    print(f"   Errors: {error_count}")
-    print(f"   BigQuery batches executed: {num_batches} (batch size: {batch_size})")
-    print(f"{'='*80}\n")
 
     # Construct and save leaderboard data
     print(f"\n{'='*80}")
