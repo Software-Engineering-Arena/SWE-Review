@@ -222,7 +222,7 @@ def generate_table_union_statements(start_date, end_date):
 # BIGQUERY FUNCTIONS
 # =============================================================================
 
-def fetch_all_pr_metadata_batched(client, identifiers, start_date, end_date, batch_size=100):
+def fetch_all_pr_metadata_batched(client, identifiers, start_date, end_date, batch_size=50):
     """
     Fetch PR review metadata for ALL agents using BATCHED BigQuery queries.
     Splits agents into smaller batches to avoid performance issues with large queries.
@@ -1005,7 +1005,7 @@ def mine_all_agents():
     try:
         # Use batched approach for better performance
         all_metadata = fetch_all_pr_metadata_batched(
-            client, identifiers, start_date, end_date, batch_size=100
+            client, identifiers, start_date, end_date, batch_size=50
         )
     except Exception as e:
         print(f"✗ Error during BigQuery fetch: {str(e)}")
@@ -1055,7 +1055,7 @@ def mine_all_agents():
     
     # Calculate number of batches
     total_identifiers = len(identifiers)
-    batch_size = 100
+    batch_size = 50
     num_batches = (total_identifiers + batch_size - 1) // batch_size  # Ceiling division
 
     print(f"\n{'='*80}")

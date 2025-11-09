@@ -208,7 +208,7 @@ def get_bigquery_client():
         raise ValueError("GOOGLE_APPLICATION_CREDENTIALS_JSON not found in environment")
 
 
-def fetch_all_pr_metadata_batched(client, identifiers, start_date, end_date, batch_size=100):
+def fetch_all_pr_metadata_batched(client, identifiers, start_date, end_date, batch_size=50):
     """
     Fetch PR review metadata for ALL agents using BATCHED BigQuery queries.
     Splits agents into smaller batches to avoid performance issues with large queries.
@@ -218,7 +218,7 @@ def fetch_all_pr_metadata_batched(client, identifiers, start_date, end_date, bat
         identifiers: List of GitHub usernames/bot identifiers
         start_date: Start datetime (timezone-aware)
         end_date: End datetime (timezone-aware)
-        batch_size: Number of agents to process per batch (default: 100)
+        batch_size: Number of agents to process per batch (default: 50)
 
     Returns:
         Dictionary mapping agent identifier to list of PR metadata
@@ -2148,7 +2148,7 @@ def construct_leaderboard_from_metadata():
 # UI FUNCTIONS
 # =============================================================================
 
-def create_monthly_metrics_plot(top_n=None):
+def create_monthly_metrics_plot(top_n=5):
     """
     Create a Plotly figure with dual y-axes showing:
     - Left y-axis: Acceptance Rate (%) as line curves
@@ -2157,7 +2157,7 @@ def create_monthly_metrics_plot(top_n=None):
     Each agent gets a unique color for both their line and bars.
 
     Args:
-        top_n: If specified, only show metrics for the top N agents by total reviews.
+        top_n: Number of top agents to show (default: 5)
     """
     # Try loading from saved dataset first
     saved_data = load_leaderboard_data_from_hf()
@@ -2652,7 +2652,7 @@ with gr.Blocks(title="SWE Agent Review Leaderboard", theme=gr.themes.Soft()) as 
 
             # Load monthly metrics when app starts
             app.load(
-                fn=lambda: create_monthly_metrics_plot(top_n=5),
+                fn=lambda: create_monthly_metrics_plot(),
                 inputs=[],
                 outputs=[monthly_metrics_plot]
             )
