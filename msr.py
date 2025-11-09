@@ -119,10 +119,6 @@ def is_rate_limit_error(e):
         f"⏳ Rate limited. Retrying in {details['wait']/60:.1f} minutes ({details['wait']:.0f}s) - attempt {details['tries']}/8..."
     )
 )
-def upload_large_folder_with_backoff(api, **kwargs):
-    """Wrapper for api.upload_large_folder() with exponential backoff for rate limits."""
-    return api.upload_large_folder(**kwargs)
-
 
 @backoff.on_exception(
     backoff.expo,
@@ -170,6 +166,22 @@ def hf_hub_download_with_backoff(**kwargs):
 def upload_file_with_backoff(api, **kwargs):
     """Wrapper for api.upload_file() with exponential backoff for rate limits."""
     return api.upload_file(**kwargs)
+
+
+@backoff.on_exception(
+    backoff.expo,
+    HfHubHTTPError,
+    max_tries=8,
+    base=300,
+    max_value=3600,
+    giveup=lambda e: not is_rate_limit_error(e),
+    on_backoff=lambda details: print(
+        f"⏳ Rate limited. Retrying in {details['wait']/60:.1f} minutes ({details['wait']:.0f}s) - attempt {details['tries']}/8..."
+    )
+)
+def upload_folder_with_backoff(api, **kwargs):
+    """Wrapper for api.upload_folder() with exponential backoff for rate limits."""
+    return api.upload_folder(**kwargs)
 
 
 def get_bigquery_client():
@@ -597,14 +609,14 @@ def save_review_metadata_to_hf(metadata_list, agent_identifier):
                 save_jsonl(local_filename, day_metadata)
                 print(f"      Prepared {len(day_metadata)} reviews for {filename}")
 
-            # Upload entire folder using upload_large_folder (optimized for large files)
-            # Note: upload_large_folder creates multiple commits automatically and doesn't support custom commit_message
+            # Upload entire folder using upload_folder (single commit per agent)
             print(f"   📤 Uploading {len(grouped)} files ({len(metadata_list)} total reviews)...")
-            upload_large_folder_with_backoff(
+            upload_folder_with_backoff(
                 api=api,
                 folder_path=temp_dir,
                 repo_id=REVIEW_METADATA_REPO,
-                repo_type="dataset"
+                repo_type="dataset",
+                commit_message=f"Update review metadata for {agent_identifier}"
             )
             print(f"   ✓ Batch upload complete for {agent_identifier}")
 
