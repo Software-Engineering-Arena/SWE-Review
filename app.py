@@ -128,19 +128,6 @@ def is_rate_limit_error(e):
         f"⏳ Rate limited. Retrying in {details['wait']/60:.1f} minutes ({details['wait']:.0f}s) - attempt {details['tries']}/8..."
     )
 )
-
-
-@backoff.on_exception(
-    backoff.expo,
-    HfHubHTTPError,
-    max_tries=8,
-    base=300,
-    max_value=3600,
-    giveup=lambda e: not is_rate_limit_error(e),
-    on_backoff=lambda details: print(
-        f"⏳ Rate limited. Retrying in {details['wait']/60:.1f} minutes ({details['wait']:.0f}s) - attempt {details['tries']}/8..."
-    )
-)
 def list_repo_files_with_backoff(api, **kwargs):
     """Wrapper for api.list_repo_files() with exponential backoff for rate limits."""
     return api.list_repo_files(**kwargs)
