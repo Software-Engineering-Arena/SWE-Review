@@ -2065,8 +2065,98 @@ def mine_all_agents():
     print(f"{'='*80}")
 
     try:
-        # Fetch and update reviews
-        fetch_and_update_weekly_reviews()
+        client = get_bigquery_client()
+
+        # Load all agents
+        agents = load_agents_from_hf()
+        if not agents:
+            print("No agents found in HuggingFace dataset")
+            return
+
+        # Calculate date range
+        today_utc = datetime.now(timezone.utc)
+        today_midnight = datetime.combine(today_utc.date(), datetime.min.time(), tzinfo=timezone.utc)
+        update_start_midnight = today_midnight - timedelta(days=UPDATE_TIME_FRAME_DAYS)
+        cutoff_date = today_midnight - timedelta(days=LEADERBOARD_TIME_FRAME_DAYS - UPDATE_TIME_FRAME_DAYS)
+
+        print(f"📅 Time Range Configuration:")
+        print(f"   Update period start (12am UTC): {update_start_midnight.isoformat()}")
+        print(f"   Today 12am UTC: {today_midnight.isoformat()}")
+        print(f"   Cutoff for existing reviews: {cutoff_date.isoformat()}")
+        print(f"   Examining reviews from: {cutoff_date.date()} to {today_midnight.date()}")
+
+        for agent in agents:
+            identifier = agent.get('github_identifier')
+            agent_name = agent.get('name', 'Unknown')
+
+            if not identifier:
+                print(f"Warning: Skipping agent without identifier: {agent}")
+                continue
+
+            try:
+                print(f"\n{'='*60}")
+                print(f"Processing: {agent_name} ({identifier})")
+                print(f"{'='*60}")
+
+                # Step 1: Load all existing metadata within timeframe
+                print(f"📊 Loading existing metadata from last {LEADERBOARD_TIME_FRAME_DAYS - UPDATE_TIME_FRAME_DAYS} days...")
+                all_metadata = load_review_metadata()
+                agent_metadata = [r for r in all_metadata if r.get("agent_identifier") == identifier]
+
+                # Filter to last (LEADERBOARD_TIME_FRAME_DAYS - UPDATE_TIME_FRAME_DAYS) days (from cutoff to today)
+                recent_metadata = []
+                for review in agent_metadata:
+                    reviewed_at = review.get('reviewed_at', '')
+                    if reviewed_at:
+                        try:
+                            review_date = datetime.fromisoformat(reviewed_at.replace('Z', '+00:00'))
+                            if cutoff_date <= review_date < today_midnight:
+                                recent_metadata.append(review)
+                        except Exception as e:
+                            print(f"   Warning: Could not parse date '{reviewed_at}': {e}")
+                            continue
+
+                print(f"   ✓ Loaded {len(recent_metadata)} existing reviews from timeframe")
+
+                # Step 2: Fetch NEW reviews from last UPDATE_TIME_FRAME_DAYS to today using BigQuery
+                print(f"🔍 Fetching new reviews from {update_start_midnight.isoformat()} to {today_midnight.isoformat()} using BigQuery...")
+
+                review_rows = fetch_reviews_from_bigquery(client, identifier, update_start_midnight, today_midnight)
+
+                # Extract unique PRs
+                urls = list(set([row.url for row in review_rows if row.url]))
+                print(f"   Found {len(review_rows)} review events across {len(urls)} unique PRs")
+
+                # Extract metadata for new reviews
+                review_metadata = []
+                seen_prs = set()
+                for row in review_rows:
+                    url = row.url
+                    if url in seen_prs:
+                        continue
+                    seen_prs.add(url)
+
+                    metadata = extract_review_metadata_from_bigquery(row)
+                    metadata['agent_identifier'] = identifier
+                    review_metadata.append(metadata)
+
+                print(f"   ✓ Found {len(review_metadata)} unique PRs in {UPDATE_TIME_FRAME_DAYS}-day window")
+
+                # Step 3: Combine and save all metadata
+                all_updated_metadata = recent_metadata + review_metadata
+
+                if all_updated_metadata:
+                    print(f"💾 Saving {len(all_updated_metadata)} total reviews to HuggingFace...")
+                    save_review_metadata_to_hf(all_updated_metadata, identifier)
+                    print(f"✓ Updated {identifier}: {len(recent_metadata)} existing + {len(review_metadata)} new = {len(all_updated_metadata)} total")
+                else:
+                    print(f"   No reviews to save for {identifier}")
+
+            except Exception as e:
+                print(f"✗ Error processing {identifier}: {str(e)}")
+                import traceback
+                traceback.print_exc()
+                continue
 
         # After mining is complete, save leaderboard and metrics to HuggingFace
         print(f"\n📤 Uploading leaderboard and metrics data...")
@@ -2093,7 +2183,7 @@ def mine_all_agents():
         print(f"\n✅ Incremental Update completed at {datetime.now(timezone.utc).isoformat()}")
 
     except Exception as e:
-        print(f"✗ Weekly update failed: {str(e)}")
+        print(f"✗ Monthly update failed: {str(e)}")
         import traceback
         traceback.print_exc()
 
@@ -2436,176 +2526,27 @@ def submit_agent(identifier, agent_name, developer, website):
 
 
 # =============================================================================
-# BACKGROUND TASKS
-# =============================================================================
-
-def fetch_and_update_weekly_reviews():
-    """
-    Fetch and update reviews with comprehensive status checking using BigQuery.
-
-    Strategy:
-    1. For each agent:
-       - Examine ALL open reviews from last LEADERBOARD_TIME_FRAME_DAYS - UPDATE_TIME_FRAME_DAYS for their closed_at status
-       - Update PR status for all existing metadata using BigQuery (last LEADERBOARD_TIME_FRAME_DAYS - UPDATE_TIME_FRAME_DAYS)
-       - Fetch new reviews from last UPDATE_TIME_FRAME_DAYS days using BigQuery
-       - Save all updated/new metadata back to HuggingFace
-    """
-    # Initialize BigQuery client
-    try:
-        client = get_bigquery_client()
-    except Exception as e:
-        print(f"✗ Failed to initialize BigQuery client: {str(e)}")
-        return
-
-    # Load all agents
-    agents = load_agents_from_hf()
-    if not agents:
-        print("No agents found in HuggingFace dataset")
-        return
-
-    # Calculate date range
-    today_utc = datetime.now(timezone.utc)
-    today_midnight = datetime.combine(today_utc.date(), datetime.min.time(), tzinfo=timezone.utc)
-    update_start_midnight = today_midnight - timedelta(days=UPDATE_TIME_FRAME_DAYS)
-    cutoff_date = today_midnight - timedelta(days=LEADERBOARD_TIME_FRAME_DAYS - UPDATE_TIME_FRAME_DAYS)
-
-    print(f"📅 Time Range Configuration:")
-    print(f"   Update period start (12am UTC): {update_start_midnight.isoformat()}")
-    print(f"   Today 12am UTC: {today_midnight.isoformat()}")
-    print(f"   Cutoff for existing reviews: {cutoff_date.isoformat()}")
-    print(f"   Examining reviews from: {cutoff_date.date()} to {today_midnight.date()}")
-
-    for agent in agents:
-        identifier = agent.get('github_identifier')
-        agent_name = agent.get('name', 'Unknown')
-
-        if not identifier:
-            print(f"Warning: Skipping agent without identifier: {agent}")
-            continue
-
-        try:
-            print(f"\n{'='*60}")
-            print(f"Processing: {agent_name} ({identifier})")
-            print(f"{'='*60}")
-
-            # Step 1: Load all existing metadata within timeframe
-            print(f"📊 Loading existing metadata from last {LEADERBOARD_TIME_FRAME_DAYS - UPDATE_TIME_FRAME_DAYS} days...")
-            all_metadata = load_review_metadata()
-            agent_metadata = [r for r in all_metadata if r.get("agent_identifier") == identifier]
-
-            # Filter to last (LEADERBOARD_TIME_FRAME_DAYS - UPDATE_TIME_FRAME_DAYS) days (from cutoff to today)
-            recent_metadata = []
-            for review in agent_metadata:
-                reviewed_at = review.get('reviewed_at', '')
-                if reviewed_at:
-                    try:
-                        review_date = datetime.fromisoformat(reviewed_at.replace('Z', '+00:00'))
-                        if cutoff_date <= review_date < today_midnight:
-                            recent_metadata.append(review)
-                    except Exception as e:
-                        print(f"   Warning: Could not parse date '{reviewed_at}': {e}")
-                        continue
-
-            print(f"   ✓ Loaded {len(recent_metadata)} existing reviews from timeframe")
-
-            # Step 2: Fetch NEW reviews from last UPDATE_TIME_FRAME_DAYS to today using BigQuery
-            print(f"🔍 Fetching new reviews from {update_start_midnight.isoformat()} to {today_midnight.isoformat()} using BigQuery...")
-
-            review_rows = fetch_reviews_from_bigquery(client, identifier, update_start_midnight, today_midnight)
-
-            # Extract unique PRs
-            urls = list(set([row.url for row in review_rows if row.url]))
-            print(f"   Found {len(review_rows)} review events across {len(urls)} unique PRs")
-
-            # Extract metadata for new reviews
-            weekly_metadata = []
-            seen_prs = set()
-            for row in review_rows:
-                url = row.url
-                if url in seen_prs:
-                    continue
-                seen_prs.add(url)
-
-                metadata = extract_review_metadata_from_bigquery(row)
-                metadata['agent_identifier'] = identifier
-                weekly_metadata.append(metadata)
-
-            print(f"   ✓ Found {len(weekly_metadata)} unique PRs in {UPDATE_TIME_FRAME_DAYS}-day window")
-
-            # Step 3: Combine and save all metadata
-            all_updated_metadata = recent_metadata + weekly_metadata
-
-            if all_updated_metadata:
-                print(f"💾 Saving {len(all_updated_metadata)} total reviews to HuggingFace...")
-                save_review_metadata_to_hf(all_updated_metadata, identifier)
-                print(f"✓ Updated {identifier}: {len(recent_metadata)} existing + {len(weekly_metadata)} new = {len(all_updated_metadata)} total")
-            else:
-                print(f"   No reviews to save for {identifier}")
-
-        except Exception as e:
-            print(f"✗ Error processing {identifier}: {str(e)}")
-            import traceback
-            traceback.print_exc()
-            continue
-
-
-# =============================================================================
-# STARTUP & INITIALIZATION
-# =============================================================================
-
-def initialize_leaderboard_data():
-    """
-    Initialize leaderboard data on startup.
-    If saved data doesn't exist, construct from metadata and save.
-    """
-    print(f"\n{'='*80}")
-    print(f"🚀 Initializing leaderboard data...")
-    print(f"{'='*80}\n")
-
-    # Try loading from saved dataset
-    saved_data = load_leaderboard_data_from_hf()
-
-    if saved_data:
-        print(f"✓ Leaderboard data already exists (last updated: {saved_data.get('last_updated', 'Unknown')})")
-    else:
-        print(f"⚠️ No saved leaderboard data found. Constructing from metadata...")
-        try:
-            # Save leaderboard and metrics to HuggingFace
-            if save_leaderboard_and_metrics_to_hf():
-                print(f"✓ Initial leaderboard data created and saved")
-            else:
-                print(f"⚠️ Failed to save initial leaderboard data")
-        except Exception as e:
-            print(f"✗ Failed to initialize leaderboard data: {str(e)}")
-            import traceback
-            traceback.print_exc()
-
-    print(f"\n{'='*80}")
-    print(f"✓ Leaderboard initialization complete")
-    print(f"{'='*80}\n")
-
-
-# =============================================================================
 # GRADIO APPLICATION
 # =============================================================================
 
-# Initialize leaderboard data on startup
-initialize_leaderboard_data()
+print(f"\n🚀 Starting SWE Agent PR Leaderboard")
+print(f"   Leaderboard time frame: {LEADERBOARD_TIME_FRAME_DAYS} days ({LEADERBOARD_TIME_FRAME_DAYS // 30} months)")
+print(f"   Mining update frequency: Every {UPDATE_TIME_FRAME_DAYS} days\n")
 
-# Start APScheduler for incremental updates at 12:00 AM UTC every Monday
+# Start APScheduler for monthly PR mining at 12:00 AM UTC every 1st of the month
 scheduler = BackgroundScheduler(timezone="UTC")
 scheduler.add_job(
     mine_all_agents,
-    trigger=CronTrigger(day_of_week='mon', hour=0, minute=0),  # 12:00 AM UTC every Monday
-    id='incremental_review_mining',
-    name='Incremental Review Mining',
+    trigger=CronTrigger(day=1, hour=0, minute=0),  # 12:00 AM UTC every 1st of the month
+    id='monthly_review_mining',
+    name='Monthly Review Mining',
     replace_existing=True
 )
 scheduler.start()
 print(f"\n{'='*80}")
 print(f"✓ Scheduler initialized successfully")
-print(f"⛏️  Mining schedule: Every Monday at 12:00 AM UTC")
-print(f"📥 On startup: Loads cached data from {LEADERBOARD_REPO}")
+print(f"⛏️  Mining schedule: Every 1st of the month at 12:00 AM UTC")
+print(f"📥 On startup: Only loads cached data from HuggingFace (no mining)")
 print(f"{'='*80}\n")
 
 # Create Gradio interface
