@@ -21,7 +21,7 @@ load_dotenv()
 # CONFIGURATION
 # =============================================================================
 
-AGENTS_REPO = "SWE-Arena/agent_metadata"
+AGENTS_REPO = "SWE-Arena/bot_metadata"
 REVIEW_METADATA_REPO = "SWE-Arena/review_metadata"
 LEADERBOARD_REPO = "SWE-Arena/leaderboard_metadata"  # HuggingFace dataset for leaderboard data
 LEADERBOARD_TIME_FRAME_DAYS = 180  # Time frame for leaderboard
@@ -919,10 +919,10 @@ def construct_leaderboard_from_metadata():
         agent_name = agent.get('name', 'Unknown')
 
         # Filter metadata for this agent
-        agent_metadata = [review for review in all_metadata if review.get("agent_identifier") == identifier]
+        bot_metadata = [review for review in all_metadata if review.get("agent_identifier") == identifier]
 
         # Calculate stats
-        stats = calculate_review_stats_from_metadata(agent_metadata)
+        stats = calculate_review_stats_from_metadata(bot_metadata)
 
         cache_dict[identifier] = {
             'name': agent_name,
