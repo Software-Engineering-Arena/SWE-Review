@@ -215,6 +215,41 @@ def get_bigquery_client():
         raise ValueError("GOOGLE_APPLICATION_CREDENTIALS_JSON not found in environment")
 
 
+def generate_table_union_statements(start_date, end_date):
+    """
+    Generate UNION ALL statements for githubarchive.month tables in date range.
+    Uses monthly tables instead of daily to drastically reduce query size.
+
+    Args:
+        start_date: Start datetime
+        end_date: End datetime
+
+    Returns:
+        String with UNION ALL SELECT statements for all monthly tables in range
+    """
+    table_names = []
+
+    # Start from the beginning of start_date's month
+    current_date = start_date.replace(day=1)
+
+    # End at the beginning of end_date's month (inclusive)
+    end_month = end_date.replace(day=1)
+
+    while current_date <= end_month:
+        table_name = f"`githubarchive.month.{current_date.strftime('%Y%m')}`"
+        table_names.append(table_name)
+
+        # Move to next month
+        if current_date.month == 12:
+            current_date = current_date.replace(year=current_date.year + 1, month=1)
+        else:
+            current_date = current_date.replace(month=current_date.month + 1)
+
+    # Create UNION ALL chain
+    union_parts = [f"SELECT * FROM {table}" for table in table_names]
+    return " UNION ALL ".join(union_parts)
+
+
 def fetch_all_pr_metadata_batched(client, identifiers, start_date, end_date, batch_size=100, upload_immediately=True):
     """
     Fetch PR review metadata for ALL agents using BATCHED BigQuery queries.
@@ -315,7 +350,7 @@ def fetch_reviews_from_bigquery(client, identifier, start_date, end_date):
     NOTE: This function is designed for querying a single agent at a time.
     For querying multiple agents efficiently, use fetch_all_pr_metadata_batched() instead.
 
-    Queries githubarchive.day.YYYYMMDD tables for PullRequestReviewEvent where
+    Queries githubarchive.month.YYYYMM tables for PullRequestReviewEvent where
     actor.login matches the agent identifier, and joins with PR status.
 
     Args:
@@ -330,24 +365,12 @@ def fetch_reviews_from_bigquery(client, identifier, start_date, end_date):
     print(f"\n🔍 Querying BigQuery for reviews by {identifier}")
     print(f"   Time range: {start_date.strftime('%Y-%m-%d')} to {end_date.strftime('%Y-%m-%d')}")
 
-    # Generate list of table names for each day in the range
-    review_tables = []
-    current_date = start_date
-    while current_date < end_date:
-        table_name = f"`githubarchive.day.{current_date.strftime('%Y%m%d')}`"
-        review_tables.append(f"SELECT * FROM {table_name}")
-        current_date += timedelta(days=1)
-    review_union = " UNION ALL ".join(review_tables)
+    # Generate monthly table UNION statements for review period
+    review_union = generate_table_union_statements(start_date, end_date)
 
-    # Generate status tables (lookback for PR status)
+    # Generate monthly table UNION statements for PR status (lookback)
     status_start = end_date - timedelta(days=LEADERBOARD_TIME_FRAME_DAYS)
-    status_tables = []
-    current_date = status_start
-    while current_date < end_date:
-        table_name = f"`githubarchive.day.{current_date.strftime('%Y%m%d')}`"
-        status_tables.append(f"SELECT * FROM {table_name}")
-        current_date += timedelta(days=1)
-    status_union = " UNION ALL ".join(status_tables)
+    status_union = generate_table_union_statements(status_start, end_date)
 
     # Build comprehensive query with CTEs for PR status
     query = f"""
@@ -400,7 +423,10 @@ def fetch_reviews_from_bigquery(client, identifier, start_date, end_date):
         ]
     )
 
-    print(f"   Querying {len(review_tables)} review tables and {len(status_tables)} status tables...")
+    # Calculate months for logging
+    review_months = ((end_date.year - start_date.year) * 12 + end_date.month - start_date.month + 1)
+    status_months = ((end_date.year - status_start.year) * 12 + end_date.month - status_start.month + 1)
+    print(f"   Querying {review_months} monthly review tables and {status_months} monthly status tables...")
 
     try:
         query_job = client.query(query, job_config=job_config)
