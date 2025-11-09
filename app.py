@@ -2049,7 +2049,7 @@ def save_leaderboard_and_metrics_to_hf():
 # DATA MANAGEMENT
 # =============================================================================
 
-def update_all_agents_incremental():
+def mine_all_agents():
     """
     Scheduled task for incremental review mining and statistics update.
 
@@ -2595,7 +2595,7 @@ initialize_leaderboard_data()
 # Start APScheduler for incremental updates at 12:00 AM UTC every Monday
 scheduler = BackgroundScheduler(timezone="UTC")
 scheduler.add_job(
-    update_all_agents_incremental,
+    mine_all_agents,
     trigger=CronTrigger(day_of_week='mon', hour=0, minute=0),  # 12:00 AM UTC every Monday
     id='incremental_review_mining',
     name='Incremental Review Mining',
