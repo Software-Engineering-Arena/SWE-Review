@@ -2051,141 +2051,109 @@ def save_leaderboard_and_metrics_to_hf():
 
 def mine_all_agents():
     """
-    Scheduled task for incremental review mining and statistics update.
-
-    Strategy:
-    1. Update PR status for all existing metadata (last LEADERBOARD_TIME_FRAME_DAYS - UPDATE_TIME_FRAME_DAYS)
-    2. Fetch new reviews from the last UPDATE_TIME_FRAME_DAYS days
-    3. Save all updated/new metadata back to HuggingFace
-    4. Reload statistics from updated metadata
-    5. Save leaderboard and monthly metrics to swe_leaderboard dataset
+    Mine review metadata for all agents within UPDATE_TIME_FRAME_DAYS and save to HuggingFace.
+    Uses BATCHED BigQuery queries for all agents (efficient approach).
     """
-    print(f"\n{'='*80}")
-    print(f"🕛 Incremental Update started at {datetime.now(timezone.utc).isoformat()}")
-    print(f"{'='*80}")
+    # Load agent metadata from HuggingFace
+    agents = load_agents_from_hf()
+    if not agents:
+        print("No agents found in HuggingFace dataset")
+        return
 
+    # Extract all identifiers
+    identifiers = [agent['github_identifier'] for agent in agents if agent.get('github_identifier')]
+    if not identifiers:
+        print("No valid agent identifiers found")
+        return
+
+    print(f"\n{'='*80}")
+    print(f"Starting review metadata mining for {len(identifiers)} agents")
+    print(f"Time frame: Last {UPDATE_TIME_FRAME_DAYS} days")
+    print(f"Data source: BigQuery + GitHub Archive (BATCHED QUERIES)")
+    print(f"{'='*80}\n")
+
+    # Initialize BigQuery client
     try:
         client = get_bigquery_client()
-
-        # Load all agents
-        agents = load_agents_from_hf()
-        if not agents:
-            print("No agents found in HuggingFace dataset")
-            return
-
-        # Calculate date range
-        today_utc = datetime.now(timezone.utc)
-        today_midnight = datetime.combine(today_utc.date(), datetime.min.time(), tzinfo=timezone.utc)
-        update_start_midnight = today_midnight - timedelta(days=UPDATE_TIME_FRAME_DAYS)
-        cutoff_date = today_midnight - timedelta(days=LEADERBOARD_TIME_FRAME_DAYS - UPDATE_TIME_FRAME_DAYS)
-
-        print(f"📅 Time Range Configuration:")
-        print(f"   Update period start (12am UTC): {update_start_midnight.isoformat()}")
-        print(f"   Today 12am UTC: {today_midnight.isoformat()}")
-        print(f"   Cutoff for existing reviews: {cutoff_date.isoformat()}")
-        print(f"   Examining reviews from: {cutoff_date.date()} to {today_midnight.date()}")
-
-        for agent in agents:
-            identifier = agent.get('github_identifier')
-            agent_name = agent.get('name', 'Unknown')
-
-            if not identifier:
-                print(f"Warning: Skipping agent without identifier: {agent}")
-                continue
-
-            try:
-                print(f"\n{'='*60}")
-                print(f"Processing: {agent_name} ({identifier})")
-                print(f"{'='*60}")
-
-                # Step 1: Load all existing metadata within timeframe
-                print(f"📊 Loading existing metadata from last {LEADERBOARD_TIME_FRAME_DAYS - UPDATE_TIME_FRAME_DAYS} days...")
-                all_metadata = load_review_metadata()
-                agent_metadata = [r for r in all_metadata if r.get("agent_identifier") == identifier]
-
-                # Filter to last (LEADERBOARD_TIME_FRAME_DAYS - UPDATE_TIME_FRAME_DAYS) days (from cutoff to today)
-                recent_metadata = []
-                for review in agent_metadata:
-                    reviewed_at = review.get('reviewed_at', '')
-                    if reviewed_at:
-                        try:
-                            review_date = datetime.fromisoformat(reviewed_at.replace('Z', '+00:00'))
-                            if cutoff_date <= review_date < today_midnight:
-                                recent_metadata.append(review)
-                        except Exception as e:
-                            print(f"   Warning: Could not parse date '{reviewed_at}': {e}")
-                            continue
-
-                print(f"   ✓ Loaded {len(recent_metadata)} existing reviews from timeframe")
-
-                # Step 2: Fetch NEW reviews from last UPDATE_TIME_FRAME_DAYS to today using BigQuery
-                print(f"🔍 Fetching new reviews from {update_start_midnight.isoformat()} to {today_midnight.isoformat()} using BigQuery...")
-
-                review_rows = fetch_reviews_from_bigquery(client, identifier, update_start_midnight, today_midnight)
-
-                # Extract unique PRs
-                urls = list(set([row.url for row in review_rows if row.url]))
-                print(f"   Found {len(review_rows)} review events across {len(urls)} unique PRs")
-
-                # Extract metadata for new reviews
-                review_metadata = []
-                seen_prs = set()
-                for row in review_rows:
-                    url = row.url
-                    if url in seen_prs:
-                        continue
-                    seen_prs.add(url)
-
-                    metadata = extract_review_metadata_from_bigquery(row)
-                    metadata['agent_identifier'] = identifier
-                    review_metadata.append(metadata)
-
-                print(f"   ✓ Found {len(review_metadata)} unique PRs in {UPDATE_TIME_FRAME_DAYS}-day window")
-
-                # Step 3: Combine and save all metadata
-                all_updated_metadata = recent_metadata + review_metadata
-
-                if all_updated_metadata:
-                    print(f"💾 Saving {len(all_updated_metadata)} total reviews to HuggingFace...")
-                    save_review_metadata_to_hf(all_updated_metadata, identifier)
-                    print(f"✓ Updated {identifier}: {len(recent_metadata)} existing + {len(review_metadata)} new = {len(all_updated_metadata)} total")
-                else:
-                    print(f"   No reviews to save for {identifier}")
-
-            except Exception as e:
-                print(f"✗ Error processing {identifier}: {str(e)}")
-                import traceback
-                traceback.print_exc()
-                continue
-
-        # After mining is complete, save leaderboard and metrics to HuggingFace
-        print(f"\n📤 Uploading leaderboard and metrics data...")
-        if save_leaderboard_and_metrics_to_hf():
-            print(f"✓ Leaderboard and metrics successfully uploaded to {LEADERBOARD_REPO}")
-        else:
-            print(f"⚠️ Failed to upload leaderboard and metrics data")
-
-        # Get the final count (reload from saved data)
-        saved_data = load_leaderboard_data_from_hf()
-        agent_count = 0
-        if saved_data and 'leaderboard' in saved_data:
-            agent_count = len(saved_data['leaderboard'])
-
-        print(f"\n{'='*80}")
-        print(f"📊 Update Summary:")
-        print(f"   ✓ Updated existing review statuses")
-        print(f"   ✓ Fetched new reviews from last {UPDATE_TIME_FRAME_DAYS} days")
-        print(f"   ✓ Leaderboard constructed with {agent_count} agents")
-        print(f"   ✓ Monthly metrics calculated")
-        print(f"   ✓ Data saved to {LEADERBOARD_REPO}")
-        print(f"{'='*80}")
-
-        print(f"\n✅ Incremental Update completed at {datetime.now(timezone.utc).isoformat()}")
-
     except Exception as e:
-        print(f"✗ Monthly update failed: {str(e)}")
+        print(f"✗ Failed to initialize BigQuery client: {str(e)}")
+        return
+
+    # Define time range: past UPDATE_TIME_FRAME_DAYS (excluding today)
+    current_time = datetime.now(timezone.utc)
+    end_date = current_time.replace(hour=0, minute=0, second=0, microsecond=0)
+    start_date = end_date - timedelta(days=UPDATE_TIME_FRAME_DAYS)
+
+    try:
+        # Use batched approach for better performance
+        all_metadata = fetch_all_pr_metadata_batched(
+            client, identifiers, start_date, end_date, batch_size=50
+        )
+    except Exception as e:
+        print(f"✗ Error during BigQuery fetch: {str(e)}")
         import traceback
         traceback.print_exc()
+        return
+
+    # Save results for each agent
+    print(f"\n{'='*80}")
+    print(f"💾 Saving results to HuggingFace for each agent...")
+    print(f"{'='*80}\n")
+
+    success_count = 0
+    error_count = 0
+    no_data_count = 0
+
+    for i, agent in enumerate(agents, 1):
+        identifier = agent.get('github_identifier')
+        agent_name = agent.get('name', 'Unknown')
+
+        if not identifier:
+            print(f"[{i}/{len(agents)}] Skipping agent without identifier")
+            error_count += 1
+            continue
+
+        metadata = all_metadata.get(identifier, [])
+
+        print(f"[{i}/{len(agents)}] {agent_name} ({identifier}):")
+
+        try:
+            if metadata:
+                print(f"   💾 Saving {len(metadata)} review records...")
+                if save_review_metadata_to_hf(metadata, identifier):
+                    success_count += 1
+                else:
+                    error_count += 1
+            else:
+                print(f"   No reviews found")
+                no_data_count += 1
+
+        except Exception as e:
+            print(f"   ✗ Error saving {identifier}: {str(e)}")
+            import traceback
+            traceback.print_exc()
+            error_count += 1
+            continue
+
+    # Calculate number of batches
+    batch_size = 50
+    total_batches = (len(identifiers) + batch_size - 1) // batch_size
+
+    print(f"\n{'='*80}")
+    print(f"✅ Mining complete!")
+    print(f"   Total agents: {len(agents)}")
+    print(f"   Successfully saved: {success_count}")
+    print(f"   No data (skipped): {no_data_count}")
+    print(f"   Errors: {error_count}")
+    print(f"   BigQuery batches executed: {total_batches} (batch size: {batch_size})")
+    print(f"{'='*80}\n")
+
+    # After mining is complete, save leaderboard and metrics to HuggingFace
+    print(f"📤 Uploading leaderboard and metrics data...")
+    if save_leaderboard_and_metrics_to_hf():
+        print(f"✓ Leaderboard and metrics successfully uploaded to {LEADERBOARD_REPO}")
+    else:
+        print(f"⚠️ Failed to upload leaderboard and metrics data")
 
 
 def construct_leaderboard_from_metadata():
