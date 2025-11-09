@@ -2051,155 +2051,109 @@ def save_leaderboard_and_metrics_to_hf():
 
 def mine_all_agents():
     """
-    Scheduled task for review metadata mining and statistics update.
-
-    Execution order:
-    1. Load all agents from HuggingFace
-    2. Extract all identifiers
-    3. Initialize BigQuery client
-    4. Define time range
-    5. Fetch ALL review metadata using BATCHED BigQuery queries (efficient)
-    6. Save results for each agent
-    7. Construct leaderboard and monthly metrics
-    8. Save to HuggingFace
-
-    Uses batched approach for better performance with large numbers of agents.
+    Mine review metadata for all agents within UPDATE_TIME_FRAME_DAYS and save to HuggingFace.
+    Uses BATCHED BigQuery queries for all agents (efficient approach).
     """
+    # Load agent metadata from HuggingFace
+    agents = load_agents_from_hf()
+    if not agents:
+        print("No agents found in HuggingFace dataset")
+        return
+
+    # Extract all identifiers
+    identifiers = [agent['github_identifier'] for agent in agents if agent.get('github_identifier')]
+    if not identifiers:
+        print("No valid agent identifiers found")
+        return
+
     print(f"\n{'='*80}")
-    print(f"🕛 Review Metadata Mining Task started at {datetime.now(timezone.utc).isoformat()}")
+    print(f"Starting review metadata mining for {len(identifiers)} agents")
+    print(f"Time frame: Last {UPDATE_TIME_FRAME_DAYS} days")
+    print(f"Data source: BigQuery + GitHub Archive (BATCHED QUERIES)")
     print(f"{'='*80}\n")
 
+    # Initialize BigQuery client
     try:
-        # Step 1: Load all agents from HuggingFace
-        print("📂 Loading agents from HuggingFace...")
-        agents = load_agents_from_hf()
-        if not agents:
-            print("❌ No agents found in HuggingFace dataset")
-            return
+        client = get_bigquery_client()
+    except Exception as e:
+        print(f"✗ Failed to initialize BigQuery client: {str(e)}")
+        return
 
-        # Step 2: Extract all identifiers
-        identifiers = [agent.get('github_identifier') for agent in agents if agent.get('github_identifier')]
-        if not identifiers:
-            print("❌ No valid agent identifiers found")
-            return
+    # Define time range: past UPDATE_TIME_FRAME_DAYS (excluding today)
+    current_time = datetime.now(timezone.utc)
+    end_date = current_time.replace(hour=0, minute=0, second=0, microsecond=0)
+    start_date = end_date - timedelta(days=UPDATE_TIME_FRAME_DAYS)
 
-        print(f"✓ Loaded {len(agents)} agents ({len(identifiers)} with valid identifiers)\n")
-
-        # Step 3: Initialize BigQuery client
-        print("🔐 Initializing BigQuery client...")
-        try:
-            client = get_bigquery_client()
-            print("✓ BigQuery client initialized\n")
-        except Exception as e:
-            print(f"❌ Failed to initialize BigQuery client: {str(e)}")
-            return
-
-        # Step 4: Define time range
-        current_time = datetime.now(timezone.utc)
-        end_date = current_time.replace(hour=0, minute=0, second=0, microsecond=0)
-        start_date = end_date - timedelta(days=UPDATE_TIME_FRAME_DAYS)
-
-        print(f"📅 Time Range Configuration:")
-        print(f"   Mining period: {start_date.strftime('%Y-%m-%d')} to {end_date.strftime('%Y-%m-%d')}")
-        print(f"   Time frame: Last {UPDATE_TIME_FRAME_DAYS} days")
-        print(f"   Data source: BigQuery + GitHub Archive (BATCHED QUERIES)\n")
-
-        # Step 5: Fetch ALL review metadata using BATCHED approach
-        print(f"{'='*80}")
-        print(f"📊 Fetching review metadata using BATCHED queries...")
-        print(f"{'='*80}\n")
-
+    try:
+        # Use batched approach for better performance
         all_metadata = fetch_all_pr_metadata_batched(
             client, identifiers, start_date, end_date, batch_size=50
         )
-
-        # Step 6: Save results for each agent
-        print(f"\n{'='*80}")
-        print(f"💾 Saving results to HuggingFace for each agent...")
-        print(f"{'='*80}\n")
-
-        success_count = 0
-        error_count = 0
-        no_data_count = 0
-
-        for i, agent in enumerate(agents, 1):
-            identifier = agent.get('github_identifier')
-            agent_name = agent.get('name', 'Unknown')
-
-            if not identifier:
-                print(f"[{i}/{len(agents)}] ⚠️ Skipping agent without identifier")
-                error_count += 1
-                continue
-
-            metadata = all_metadata.get(identifier, [])
-
-            print(f"[{i}/{len(agents)}] {agent_name} ({identifier}):")
-
-            try:
-                if metadata:
-                    print(f"        💾 Saving {len(metadata)} review records...")
-                    if save_review_metadata_to_hf(metadata, identifier):
-                        success_count += 1
-                        print(f"        ✓ Successfully saved")
-                    else:
-                        error_count += 1
-                        print(f"        ✗ Failed to save")
-                else:
-                    print(f"        ⊘ No reviews found")
-                    no_data_count += 1
-
-            except Exception as e:
-                print(f"        ✗ Error saving {identifier}: {str(e)}")
-                error_count += 1
-                continue
-
-        # Step 7: Construct leaderboard and monthly metrics
-        print(f"\n{'='*80}")
-        print(f"📊 Building leaderboard and metrics...")
-        print(f"{'='*80}\n")
-
-        print("   Constructing leaderboard data from review metadata...")
-        leaderboard_dict = construct_leaderboard_from_metadata()
-
-        print("   Calculating monthly metrics for all agents...")
-        monthly_metrics = calculate_monthly_metrics_by_agent(top_n=None)
-
-        # Step 8: Save to HuggingFace
-        print(f"\n{'='*80}")
-        print(f"📤 Uploading leaderboard and metrics to HuggingFace...")
-        print(f"{'='*80}\n")
-
-        if save_leaderboard_and_metrics_to_hf():
-            print(f"✓ Leaderboard and metrics successfully uploaded to {LEADERBOARD_REPO}\n")
-        else:
-            print(f"⚠️ Failed to upload leaderboard and metrics data\n")
-
-        # Print final summary
-        batch_size = 50
-        total_batches = (len(identifiers) + batch_size - 1) // batch_size
-        total_reviews = sum(len(metadata) for metadata in all_metadata.values())
-
-        print(f"{'='*80}")
-        print(f"✅ Mining Task Complete!")
-        print(f"{'='*80}")
-        print(f"📊 Summary:")
-        print(f"   Total agents: {len(agents)}")
-        print(f"   Agents with valid identifiers: {len(identifiers)}")
-        print(f"   Successfully saved: {success_count}")
-        print(f"   No data (skipped): {no_data_count}")
-        print(f"   Errors: {error_count}")
-        print(f"   Total reviews fetched: {total_reviews}")
-        print(f"   BigQuery batches executed: {total_batches} (batch size: {batch_size})")
-        print(f"   Leaderboard entries: {len(leaderboard_dict)}")
-        print(f"   Monthly metrics agents: {len(monthly_metrics.get('agents', []))}")
-        print(f"{'='*80}\n")
-
-        print(f"✅ Mining Task completed at {datetime.now(timezone.utc).isoformat()}\n")
-
     except Exception as e:
-        print(f"❌ Mining task failed: {str(e)}")
+        print(f"✗ Error during BigQuery fetch: {str(e)}")
         import traceback
         traceback.print_exc()
+        return
+
+    # Save results for each agent
+    print(f"\n{'='*80}")
+    print(f"💾 Saving results to HuggingFace for each agent...")
+    print(f"{'='*80}\n")
+
+    success_count = 0
+    error_count = 0
+    no_data_count = 0
+
+    for i, agent in enumerate(agents, 1):
+        identifier = agent.get('github_identifier')
+        agent_name = agent.get('name', 'Unknown')
+
+        if not identifier:
+            print(f"[{i}/{len(agents)}] Skipping agent without identifier")
+            error_count += 1
+            continue
+
+        metadata = all_metadata.get(identifier, [])
+
+        print(f"[{i}/{len(agents)}] {agent_name} ({identifier}):")
+
+        try:
+            if metadata:
+                print(f"   💾 Saving {len(metadata)} review records...")
+                if save_review_metadata_to_hf(metadata, identifier):
+                    success_count += 1
+                else:
+                    error_count += 1
+            else:
+                print(f"   No reviews found")
+                no_data_count += 1
+
+        except Exception as e:
+            print(f"   ✗ Error saving {identifier}: {str(e)}")
+            import traceback
+            traceback.print_exc()
+            error_count += 1
+            continue
+
+    # Calculate number of batches
+    batch_size = 50
+    total_batches = (len(identifiers) + batch_size - 1) // batch_size
+
+    print(f"\n{'='*80}")
+    print(f"✅ Mining complete!")
+    print(f"   Total agents: {len(agents)}")
+    print(f"   Successfully saved: {success_count}")
+    print(f"   No data (skipped): {no_data_count}")
+    print(f"   Errors: {error_count}")
+    print(f"   BigQuery batches executed: {total_batches} (batch size: {batch_size})")
+    print(f"{'='*80}\n")
+
+    # After mining is complete, save leaderboard and metrics to HuggingFace
+    print(f"📤 Uploading leaderboard and metrics data...")
+    if save_leaderboard_and_metrics_to_hf():
+        print(f"✓ Leaderboard and metrics successfully uploaded to {LEADERBOARD_REPO}")
+    else:
+        print(f"⚠️ Failed to upload leaderboard and metrics data")
 
 
 def construct_leaderboard_from_metadata():
