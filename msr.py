@@ -112,9 +112,11 @@ def is_rate_limit_error(e):
     backoff.expo,
     HfHubHTTPError,
     max_tries=8,
+    base=300,
+    max_value=3600,
     giveup=lambda e: not is_rate_limit_error(e),
     on_backoff=lambda details: print(
-        f"⏳ Rate limited. Retrying in {details['wait']:.1f}s (attempt {details['tries']}/8)..."
+        f"⏳ Rate limited. Retrying in {details['wait']/60:.1f} minutes ({details['wait']:.0f}s) - attempt {details['tries']}/8..."
     )
 )
 def upload_large_folder_with_backoff(api, **kwargs):
@@ -126,9 +128,11 @@ def upload_large_folder_with_backoff(api, **kwargs):
     backoff.expo,
     HfHubHTTPError,
     max_tries=8,
+    base=300,
+    max_value=3600,
     giveup=lambda e: not is_rate_limit_error(e),
     on_backoff=lambda details: print(
-        f"⏳ Rate limited. Retrying in {details['wait']:.1f}s (attempt {details['tries']}/8)..."
+        f"⏳ Rate limited. Retrying in {details['wait']/60:.1f} minutes ({details['wait']:.0f}s) - attempt {details['tries']}/8..."
     )
 )
 def list_repo_files_with_backoff(api, **kwargs):
@@ -140,9 +144,11 @@ def list_repo_files_with_backoff(api, **kwargs):
     backoff.expo,
     HfHubHTTPError,
     max_tries=8,
+    base=300,
+    max_value=3600,
     giveup=lambda e: not is_rate_limit_error(e),
     on_backoff=lambda details: print(
-        f"⏳ Rate limited. Retrying in {details['wait']:.1f}s (attempt {details['tries']}/8)..."
+        f"⏳ Rate limited. Retrying in {details['wait']/60:.1f} minutes ({details['wait']:.0f}s) - attempt {details['tries']}/8..."
     )
 )
 def hf_hub_download_with_backoff(**kwargs):
@@ -154,9 +160,11 @@ def hf_hub_download_with_backoff(**kwargs):
     backoff.expo,
     HfHubHTTPError,
     max_tries=8,
+    base=300,
+    max_value=3600,
     giveup=lambda e: not is_rate_limit_error(e),
     on_backoff=lambda details: print(
-        f"⏳ Rate limited. Retrying in {details['wait']:.1f}s (attempt {details['tries']}/8)..."
+        f"⏳ Rate limited. Retrying in {details['wait']/60:.1f} minutes ({details['wait']:.0f}s) - attempt {details['tries']}/8..."
     )
 )
 def upload_file_with_backoff(api, **kwargs):
