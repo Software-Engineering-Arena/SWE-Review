@@ -230,7 +230,7 @@ def generate_table_union_statements(start_date, end_date):
 # BIGQUERY FUNCTIONS
 # =============================================================================
 
-def fetch_all_pr_metadata_batched(client, identifiers, start_date, end_date, batch_size=50, upload_immediately=True):
+def fetch_all_pr_metadata_batched(client, identifiers, start_date, end_date, batch_size=100, upload_immediately=True):
     """
     Fetch PR review metadata for ALL agents using BATCHED BigQuery queries.
     Splits agents into smaller batches to avoid performance issues with large queries.
@@ -240,7 +240,7 @@ def fetch_all_pr_metadata_batched(client, identifiers, start_date, end_date, bat
         identifiers: List of GitHub usernames/bot identifiers
         start_date: Start datetime (timezone-aware)
         end_date: End datetime (timezone-aware)
-        batch_size: Number of agents to process per batch (default: 50)
+        batch_size: Number of agents to process per batch (default: 100)
         upload_immediately: If True, upload each batch to HuggingFace immediately after processing (default: True)
 
     Returns:
@@ -1036,7 +1036,7 @@ def mine_all_agents():
         # Use batched approach for better performance
         # upload_immediately=True means each batch uploads to HuggingFace right after BigQuery completes
         all_metadata = fetch_all_pr_metadata_batched(
-            client, identifiers, start_date, end_date, batch_size=50, upload_immediately=True
+            client, identifiers, start_date, end_date, batch_size=100, upload_immediately=True
         )
 
         # Calculate summary statistics
